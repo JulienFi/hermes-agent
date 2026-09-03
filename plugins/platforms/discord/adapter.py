@@ -959,6 +959,32 @@ class VoiceReceiver:
 
         return completed
 
+    def speech_in_progress(self, min_duration: float = 0.5,
+                           max_gap: float = 0.4) -> bool:
+        """True while somebody is speaking *right now*.
+
+        :meth:`check_silence` only reports an utterance once it has ended,
+        i.e. ``SILENCE_THRESHOLD`` seconds after the last packet.  Barge-in
+        hung off that signal keeps the bot talking over the speaker for the
+        whole utterance plus the window (measured 2026-09-03: 3.8s, 7.4s and
+        29.1s of overlap).  This looks at the live buffers instead: audio is
+        arriving, and enough of it has arrived to be more than a click.
+
+        ``min_duration`` defaults to :attr:`MIN_SPEECH_DURATION` so we only
+        cut playback for audio that would actually become an utterance.
+        """
+        now = time.monotonic()
+        bytes_per_second = self.SAMPLE_RATE * self.CHANNELS * 2
+        with self._lock:
+            for ssrc, buf in self._buffers.items():
+                last = self._last_packet_time.get(ssrc)
+                if last is None or (now - last) > max_gap:
+                    continue
+                if (len(buf) / bytes_per_second) < min_duration:
+                    continue
+                return True
+        return False
+
     def flush_pending(self) -> list:
         """Return buffered utterances that have not yet reached silence."""
         completed = []
@@ -5034,6 +5060,22 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         return self._load_discord_bool_config("voice_barge_in", False)
 
+    def _voice_barge_in_min_speech(self) -> float:
+        """Seconds of live audio that count as "the user is speaking".
+
+        Config: ``discord.voice_barge_in_min_speech_seconds``. Lower reacts
+        faster but lets a cough or a keyboard cut the answer; the default
+        matches :attr:`VoiceReceiver.MIN_SPEECH_DURATION`, so playback is only
+        cut for audio long enough to become an utterance.
+        """
+        value = self._load_discord_float_config(
+            "voice_barge_in_min_speech_seconds",
+            VoiceReceiver.MIN_SPEECH_DURATION,
+        )
+        if not math.isfinite(value) or value <= 0:
+            return VoiceReceiver.MIN_SPEECH_DURATION
+        return min(value, 5.0)
+
     def _stop_voice_playback(self, guild_id: int) -> None:
         """Cut whatever TTS is playing in this guild (barge-in)."""
         try:
@@ -5055,9 +5097,20 @@ class DiscordAdapter(BasePlatformAdapter):
         if not receiver:
             return
         last_keepalive = time.monotonic()
+        # Read once per session: the poll below runs five times a second and
+        # must not hit the config file at that rate. A changed switch takes
+        # effect on the next /voice join, same as the silence threshold.
+        barge_in = self._voice_barge_in_enabled()
+        barge_in_min_speech = self._voice_barge_in_min_speech()
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
+
+                # Barge-in on speech *onset*. Waiting for the finished
+                # utterance means talking over the user until they stop; this
+                # cuts the answer while they are still mid-sentence.
+                if barge_in and receiver.speech_in_progress(barge_in_min_speech):
+                    self._stop_voice_playback(guild_id)
 
                 # Send periodic UDP keepalive to prevent Discord from
                 # dropping the UDP session after ~60s of silence.
@@ -5087,7 +5140,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     # still speaking. Cut the playback before the new turn
                     # starts, or the answer to the old question keeps running
                     # over the answer to the new one.
-                    if self._voice_barge_in_enabled():
+                    # Belt and braces: the onset check above normally fired
+                    # already, but a very short utterance can slip past it.
+                    if barge_in:
                         self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the
                     # bot's own playback. Reset the inactivity timer so an active

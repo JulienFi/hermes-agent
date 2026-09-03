@@ -228,6 +228,9 @@ def _prepare_loop(adapter, guild_id=42):
     receiver = MagicMock()
     receiver._running = True
     receiver.check_silence.side_effect = [[(99, b"pcm")]] + [[]] * 200
+    # A bare MagicMock returns a truthy object, which would fake an onset
+    # on every poll and make "stopped once" impossible to assert.
+    receiver.speech_in_progress.return_value = False
     adapter._voice_receivers[guild_id] = receiver
 
     vc = MagicMock()
@@ -342,3 +345,161 @@ async def test_receiver_keeps_listening_when_barge_in_is_on(monkeypatch):
     assert await _play(adapter, monkeypatch) is True
 
     receiver.pause.assert_not_called()
+
+
+# ============================================================================
+# Speech onset — the reason barge-in was still useless after the first fix
+# ============================================================================
+
+def _fill(receiver, ssrc=7, seconds=1.0, age=0.0):
+    """Put ``seconds`` of PCM into a receiver buffer, last packet ``age`` ago."""
+    per_second = receiver.SAMPLE_RATE * receiver.CHANNELS * 2
+    receiver._buffers[ssrc] = bytearray(int(per_second * seconds))
+    receiver._last_packet_time[ssrc] = time.monotonic() - age
+
+
+class TestSpeechInProgress:
+    def test_empty_receiver_is_silent(self):
+        assert _make_receiver().speech_in_progress() is False
+
+    def test_live_audio_counts_as_speech(self):
+        r = _make_receiver()
+        _fill(r, seconds=1.0, age=0.0)
+        assert r.speech_in_progress() is True
+
+    def test_a_click_is_not_speech(self):
+        """Below MIN_SPEECH_DURATION the audio would be discarded anyway."""
+        r = _make_receiver()
+        _fill(r, seconds=0.2, age=0.0)
+        assert r.speech_in_progress() is False
+
+    def test_a_finished_utterance_is_not_live(self):
+        """The buffer is still full, but no packet has arrived for a while."""
+        r = _make_receiver()
+        _fill(r, seconds=3.0, age=1.0)
+        assert r.speech_in_progress() is False
+
+    def test_gap_boundary_is_configurable(self):
+        r = _make_receiver()
+        _fill(r, seconds=3.0, age=1.0)
+        assert r.speech_in_progress(max_gap=2.0) is True
+
+    def test_min_duration_is_configurable(self):
+        r = _make_receiver()
+        _fill(r, seconds=0.2, age=0.0)
+        assert r.speech_in_progress(min_duration=0.1) is True
+
+    def test_buffer_without_a_packet_time_is_ignored(self):
+        """Stale entry from a cleared utterance must not read as speech."""
+        r = _make_receiver()
+        per_second = r.SAMPLE_RATE * r.CHANNELS * 2
+        r._buffers[7] = bytearray(per_second)
+        assert r.speech_in_progress() is False
+
+    def test_onset_fires_far_earlier_than_check_silence(self):
+        """The whole point: cut at 0.5s of speech, not 0.5s plus the window."""
+        r = _make_receiver(silence_threshold=2.5)
+        _fill(r, seconds=0.6, age=0.0)
+        assert r.speech_in_progress() is True
+        assert r.check_silence() == []
+
+
+class TestBargeInMinSpeech:
+    def test_default_matches_the_receiver_minimum(self):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+
+        adapter = _make_adapter()
+        assert adapter._voice_barge_in_min_speech() == VoiceReceiver.MIN_SPEECH_DURATION
+
+    def test_config_override(self):
+        adapter = _make_adapter({"voice_barge_in_min_speech_seconds": 0.3})
+        assert adapter._voice_barge_in_min_speech() == 0.3
+
+    @pytest.mark.parametrize("value", [0, -1, "nonsense", None, float("nan")])
+    def test_nonsense_falls_back(self, value):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+
+        adapter = _make_adapter({"voice_barge_in_min_speech_seconds": value})
+        assert adapter._voice_barge_in_min_speech() == VoiceReceiver.MIN_SPEECH_DURATION
+
+    def test_absurd_value_is_capped(self):
+        adapter = _make_adapter({"voice_barge_in_min_speech_seconds": 99})
+        assert adapter._voice_barge_in_min_speech() == 5.0
+
+
+@pytest.mark.asyncio
+async def test_loop_cuts_playback_on_onset_without_a_finished_utterance():
+    """The failure of 2026-09-03: playback ran to the end of the utterance."""
+    adapter = _make_adapter({"voice_barge_in": True})
+    receiver = MagicMock()
+    receiver._running = True
+    receiver.check_silence.return_value = []          # nothing finished, ever
+    receiver.speech_in_progress.return_value = True   # but somebody is talking
+    adapter._voice_receivers[42] = receiver
+
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    adapter._voice_clients[42] = vc
+    adapter._processed = []
+
+    task = asyncio.ensure_future(adapter._voice_listen_loop(42))
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        if vc.stop.called:
+            break
+    receiver._running = False
+    task.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await task
+
+    assert vc.stop.called
+    assert adapter._processed == []
+
+
+@pytest.mark.asyncio
+async def test_onset_is_not_polled_when_barge_in_is_off():
+    adapter = _make_adapter()
+    receiver = MagicMock()
+    receiver._running = True
+    receiver.check_silence.return_value = []
+    receiver.speech_in_progress.return_value = True
+    adapter._voice_receivers[42] = receiver
+
+    vc = MagicMock()
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    adapter._voice_clients[42] = vc
+
+    task = asyncio.ensure_future(adapter._voice_listen_loop(42))
+    await asyncio.sleep(0.7)
+    receiver._running = False
+    task.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await task
+
+    vc.stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_config_is_read_once_not_five_times_a_second():
+    """The poll runs at 5 Hz; reading config.yaml at that rate is a bug."""
+    adapter = _make_adapter({"voice_barge_in": True})
+    receiver = MagicMock()
+    receiver._running = True
+    receiver.check_silence.return_value = []
+    receiver.speech_in_progress.return_value = False
+    adapter._voice_receivers[42] = receiver
+
+    calls = []
+    real = adapter._voice_barge_in_enabled
+    adapter._voice_barge_in_enabled = lambda: (calls.append(1), real())[1]
+
+    task = asyncio.ensure_future(adapter._voice_listen_loop(42))
+    await asyncio.sleep(0.9)
+    receiver._running = False
+    task.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await task
+
+    assert len(calls) == 1
