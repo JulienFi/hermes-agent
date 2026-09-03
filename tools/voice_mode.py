@@ -1237,7 +1237,51 @@ WHISPER_HALLUCINATIONS = {
     "amara.org",
     "www.mooji.org",
     "ご視聴ありがとうございました",
+    # German. Whisper's filler on silence/background noise is "Vielen Dank."
+    # Measured 2026-09-03: 28 of 52 utterances in one Discord voice session
+    # were this phrase on an open mic outdoors, each one costing a full turn.
+    "vielen dank",
+    "danke",
+    "dankeschön",
+    "danke schön",
+    "vielen dank für's zuschauen",
+    "vielen dank fürs zuschauen",
+    "vielen dank für ihre aufmerksamkeit",
+    "untertitel im auftrag des zdf",
+    "untertitelung des zdf",
+    "untertitel der deutschen welle",
+    "bis zum nächsten mal",
+    "tschüss",
 }
+
+# Extra phrases from ``stt.hallucination_phrases`` in config.yaml, so a new
+# language or a site-specific artefact needs a config line, not a patch.
+_EXTRA_HALLUCINATIONS = None
+
+
+def _extra_hallucination_phrases() -> frozenset:
+    """Lowercased phrases from ``stt.hallucination_phrases`` (cached)."""
+    global _EXTRA_HALLUCINATIONS
+    if _EXTRA_HALLUCINATIONS is not None:
+        return _EXTRA_HALLUCINATIONS
+    phrases = frozenset()
+    try:
+        from hermes_cli.config import load_config
+        stt_cfg = load_config().get("stt", {})
+        if isinstance(stt_cfg, dict):
+            raw = stt_cfg.get("hallucination_phrases", ())
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, (list, tuple)):
+                phrases = frozenset(
+                    str(p).strip().lower().rstrip(".!?")
+                    for p in raw
+                    if isinstance(p, (str, int, float)) and str(p).strip()
+                )
+    except Exception:
+        pass
+    _EXTRA_HALLUCINATIONS = phrases
+    return phrases
 
 # Regex patterns for repetitive hallucinations (e.g. "Thank you. Thank you. Thank you.")
 _HALLUCINATION_REPEAT_RE = re.compile(
@@ -1251,8 +1295,12 @@ def is_whisper_hallucination(transcript: str) -> bool:
     cleaned = transcript.strip().lower()
     if not cleaned:
         return True
-    # Exact match against known phrases
-    if cleaned.rstrip('.!') in WHISPER_HALLUCINATIONS or cleaned in WHISPER_HALLUCINATIONS:
+    # Exact match against known phrases. Strip "?" too: Whisper writes the
+    # German filler as "Vielen Dank?" often enough to matter.
+    stripped = cleaned.rstrip('.!?')
+    if stripped in WHISPER_HALLUCINATIONS or cleaned in WHISPER_HALLUCINATIONS:
+        return True
+    if stripped in _extra_hallucination_phrases():
         return True
     # Repetitive patterns (e.g. "Thank you. Thank you. Thank you. you")
     if _HALLUCINATION_REPEAT_RE.match(cleaned):

@@ -557,6 +557,60 @@ class TestWhisperHallucinationFilter:
         assert is_whisper_hallucination("Thank you for your help with the project.") is False
         assert is_whisper_hallucination("Can you explain this code?") is False
 
+    def test_german_silence_fillers(self):
+        """Whisper writes "Vielen Dank." over silence in German.
+
+        Measured on 2026-09-03: 28 of 52 utterances in one Discord voice
+        session were this phrase alone, each one costing a full agent turn.
+        """
+        from tools.voice_mode import is_whisper_hallucination
+
+        assert is_whisper_hallucination("Vielen Dank.") is True
+        assert is_whisper_hallucination("vielen dank") is True
+        assert is_whisper_hallucination("Vielen Dank?") is True  # "?" also stripped
+        assert is_whisper_hallucination("  Danke.  ") is True
+        assert is_whisper_hallucination("Tschüss") is True
+        assert is_whisper_hallucination("Untertitel im Auftrag des ZDF") is True
+
+    def test_german_real_speech_not_filtered(self):
+        """Only the bare filler is dropped — a sentence around it survives."""
+        from tools.voice_mode import is_whisper_hallucination
+
+        assert is_whisper_hallucination("Vielen Dank für den Tipp.") is False
+        assert is_whisper_hallucination("Danke, aber wie meinst du das?") is False
+        assert is_whisper_hallucination("Okay, also ich bin Kapitän.") is False
+
+    def test_extra_phrases_from_config(self, monkeypatch):
+        """``stt.hallucination_phrases`` adds phrases without a code change."""
+        import tools.voice_mode as vm
+
+        monkeypatch.setattr(vm, "_EXTRA_HALLUCINATIONS", None)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda *a, **k: {"stt": {"hallucination_phrases": ["Abonniert den Kanal!"]}},
+        )
+        try:
+            assert vm.is_whisper_hallucination("Abonniert den Kanal!") is True
+            assert vm.is_whisper_hallucination("Abonniert den Kanal, bitte.") is False
+        finally:
+            vm._EXTRA_HALLUCINATIONS = None
+
+    def test_bad_config_does_not_crash_the_filter(self, monkeypatch):
+        """A malformed config must not take the voice loop down with it."""
+        import tools.voice_mode as vm
+
+        monkeypatch.setattr(vm, "_EXTRA_HALLUCINATIONS", None)
+
+        def _boom(*a, **k):
+            raise RuntimeError("config unreadable")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _boom)
+        try:
+            assert vm.is_whisper_hallucination("Vielen Dank.") is True
+            assert vm.is_whisper_hallucination("Wie spät ist es?") is False
+        finally:
+            vm._EXTRA_HALLUCINATIONS = None
+
 
 # ============================================================================
 # play_audio_file

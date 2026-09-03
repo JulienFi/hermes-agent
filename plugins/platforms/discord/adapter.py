@@ -641,9 +641,16 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None,
+                 silence_threshold: Optional[float] = None):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        # Per-instance end-of-utterance window. The 1.5s class default cuts
+        # a speaker off mid-thought whenever they pause to think; a Discord
+        # session on 2026-09-03 lost seven sentences to it and the user had
+        # to say "Nein, ich bin noch nicht fertig" to get the turn back.
+        if silence_threshold is not None:
+            self.SILENCE_THRESHOLD = silence_threshold
         self._running = False
 
         # Decryption
@@ -4412,6 +4419,34 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not load discord.voice_fx config: %s", e)
         return defaults
 
+    def _load_discord_float_config(self, key: str, default: float) -> float:
+        """Read a non-secret float from the top-level ``discord`` config."""
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get(key, default)
+            return float(raw)
+        except Exception as e:
+            logger.debug("Could not load discord.%s config: %s", key, e)
+            return default
+
+    def _load_discord_bool_config(self, key: str, default: bool) -> bool:
+        """Read a non-secret flag from the top-level ``discord`` config.
+
+        Accepts YAML booleans and the usual string spellings, so a value
+        typed as ``"true"`` behaves the same as ``true``.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get(key, default)
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(raw)
+        except Exception as e:
+            logger.debug("Could not load discord.%s config: %s", key, e)
+            return default
+
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
         """Read a non-secret integer from the top-level ``discord`` config."""
         try:
@@ -4665,7 +4700,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    silence_threshold=self._voice_silence_threshold(),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4765,9 +4804,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
 
             # ── Legacy one-shot path (no mixer) ─────────────────────────
-            # Pause voice receiver while playing (echo prevention)
+            # Pause voice receiver while playing (echo prevention). With
+            # barge-in on we deliberately keep listening so the user can cut
+            # in; see _voice_barge_in_enabled() for the headphone caveat.
             receiver = self._voice_receivers.get(guild_id)
-            if receiver:
+            if receiver and not self._voice_barge_in_enabled():
                 receiver.pause()
 
             try:
@@ -4965,6 +5006,49 @@ class DiscordAdapter(BasePlatformAdapter):
     # the UDP route after ~60s of silence.
     _KEEPALIVE_INTERVAL = 15
 
+    # Upper bound for the configured silence window. A typo like "25" would
+    # otherwise stall every utterance for 25 seconds with no error.
+    _MAX_SILENCE_THRESHOLD = 10.0
+
+    def _voice_silence_threshold(self) -> float:
+        """Seconds of silence that end an utterance.
+
+        Config: ``discord.voice_silence_threshold_seconds``. Invalid, zero or
+        negative values fall back to :attr:`VoiceReceiver.SILENCE_THRESHOLD`.
+        """
+        value = self._load_discord_float_config(
+            "voice_silence_threshold_seconds",
+            VoiceReceiver.SILENCE_THRESHOLD,
+        )
+        if not math.isfinite(value) or value <= 0:
+            return VoiceReceiver.SILENCE_THRESHOLD
+        return min(value, self._MAX_SILENCE_THRESHOLD)
+
+    def _voice_barge_in_enabled(self) -> bool:
+        """Whether the user may cut into TTS playback.
+
+        Config: ``discord.voice_barge_in``, off by default. When on, the
+        receiver keeps capturing while the bot speaks, so open speakers make
+        the bot transcribe its own voice and interrupt itself — this needs
+        headphones or reliable echo cancellation on the speaking client.
+        """
+        return self._load_discord_bool_config("voice_barge_in", False)
+
+    def _stop_voice_playback(self, guild_id: int) -> None:
+        """Cut whatever TTS is playing in this guild (barge-in)."""
+        try:
+            mixer = (getattr(self, "_voice_mixers", None) or {}).get(guild_id)
+            if mixer is not None and getattr(mixer, "speech_active", False):
+                mixer.stop_speech()
+                logger.info("Barge-in: mixer speech stopped (guild=%d)", guild_id)
+                return
+            vc = self._voice_clients.get(guild_id)
+            if vc is not None and vc.is_connected() and vc.is_playing():
+                vc.stop()
+                logger.info("Barge-in: playback stopped (guild=%d)", guild_id)
+        except Exception as e:
+            logger.debug("Barge-in stop failed (guild=%s): %s", guild_id, e)
+
     async def _voice_listen_loop(self, guild_id: int):
         """Periodically check for completed utterances and process them."""
         receiver = self._voice_receivers.get(guild_id)
@@ -4999,6 +5083,12 @@ class DiscordAdapter(BasePlatformAdapter):
                         is_dm=False,
                     ):
                         continue
+                    # Barge-in: this utterance arrived while the bot was
+                    # still speaking. Cut the playback before the new turn
+                    # starts, or the answer to the old question keeps running
+                    # over the answer to the new one.
+                    if self._voice_barge_in_enabled():
+                        self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the
                     # bot's own playback. Reset the inactivity timer so an active
                     # listener isn't disconnected mid-conversation (this also
