@@ -4769,6 +4769,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
                     await self._process_voice_input(guild_id, user_id, pcm_data)
 
+            # A streaming-TTS session belongs to the connection it plays
+            # into: drop it with the channel, or its registry entry outlives
+            # the voice client and declines streaming on the next join.
+            stream = (getattr(self, "_voice_streams", None) or {}).pop(guild_id, None)
+            if stream is not None:
+                try:
+                    stream.abort()
+                except Exception:
+                    pass
+
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
@@ -4913,6 +4923,33 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
         return None
 
+    def _live_stream_for(self, guild_id: int):
+        """The streaming source still playing in this guild, if any.
+
+        ``_voice_streams`` is cleared by :meth:`_release_streaming_tts`. A
+        turn cancelled between ``begin`` and ``finish`` never gets there, and
+        the stale entry would then decline streaming for every later reply of
+        the session — silently, because declining looks exactly like "not
+        supported". A source that has drained is finished by definition, so
+        treat it as gone and drop it.
+        """
+        streams = getattr(self, "_voice_streams", None)
+        if not streams:
+            return None
+        source = streams.get(guild_id)
+        if source is None:
+            return None
+        try:
+            finished = bool(source.drained.is_set())
+        except Exception:
+            # Something unexpected in the registry: err towards "busy"
+            # rather than starting a second player on the same connection.
+            return source
+        if finished:
+            streams.pop(guild_id, None)
+            return None
+        return source
+
     def supports_streaming_tts(self, chat_id: str, audio_format) -> bool:
         """True when this chat has a live voice session we can stream into."""
         guild_id = self._voice_guild_for_chat(chat_id)
@@ -4927,7 +4964,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # rather than half-supporting both.
         if (getattr(self, "_voice_mixers", None) or {}).get(guild_id) is not None:
             return False
-        if self._voice_streams.get(guild_id) is not None:
+        if self._live_stream_for(guild_id) is not None:
             return False
         try:
             from .streaming_audio import numpy_available, to_discord_pcm  # noqa: F401
@@ -4955,7 +4992,7 @@ class DiscordAdapter(BasePlatformAdapter):
         vc = self._voice_clients.get(guild_id)
         if vc is None or not vc.is_connected():
             return None
-        if self._voice_streams.get(guild_id) is not None:
+        if self._live_stream_for(guild_id) is not None:
             return None
 
         try:

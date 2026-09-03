@@ -234,8 +234,48 @@ class TestSupportsStreaming:
 
     def test_declined_while_another_stream_is_live(self):
         adapter = _make_adapter()
-        adapter._voice_streams[42] = MagicMock()
+        adapter._voice_streams[42] = StreamingPCMSource()
         assert adapter.supports_streaming_tts("777", _FMT) is False
+
+    def test_a_finished_leftover_does_not_disable_the_session(self):
+        # A turn cancelled between begin and finish leaves the registry
+        # entry behind. Declining forever after that is indistinguishable
+        # from "streaming not supported" — the worst kind of silent
+        # degradation.
+        adapter = _make_adapter()
+        stale = StreamingPCMSource()
+        stale.end()                      # drained: nothing left to play
+        adapter._voice_streams[42] = stale
+        assert adapter.supports_streaming_tts("777", _FMT) is True
+        assert 42 not in adapter._voice_streams
+
+    def test_an_aborted_leftover_does_not_disable_the_session(self):
+        adapter = _make_adapter()
+        stale = StreamingPCMSource()
+        stale.abort()
+        adapter._voice_streams[42] = stale
+        assert adapter.supports_streaming_tts("777", _FMT) is True
+
+    @pytest.mark.asyncio
+    async def test_leaving_the_channel_drops_the_stream(self):
+        # The source plays into one voice connection; keeping it past the
+        # disconnect would decline streaming on the next /voice join.
+        from unittest.mock import AsyncMock
+
+        adapter = _make_adapter()
+        live = StreamingPCMSource()
+        live.feed_native(b"\x00" * 3840)
+        adapter._voice_streams[42] = live
+        adapter._voice_locks = {}
+        adapter._voice_listen_tasks = {}
+        adapter._voice_timeout_tasks = {}
+        adapter._voice_sources = {}
+        adapter._voice_clients[42].disconnect = AsyncMock()
+
+        await adapter.leave_voice_channel(42)
+
+        assert 42 not in adapter._voice_streams
+        assert live.aborted is True
 
     def test_declined_for_a_format_we_would_have_to_mangle(self):
         adapter = _make_adapter()
