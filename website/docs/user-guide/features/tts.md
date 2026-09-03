@@ -184,6 +184,35 @@ tts:
 
 Only positive integers are honored. Zero, negative, non-numeric, or boolean values fall through to the provider default, so a broken config can't accidentally bypass the provider request limit.
 
+### Spoken replies are written for the ear (gateway)
+
+A reply that will be *heard* has different constraints than one that is read:
+markdown is noise, a bulleted list has no shape out loud, and every extra
+sentence costs the listener real seconds. When a messaging-gateway turn arrives
+as **voice input** and auto-TTS is on for that chat, Hermes appends one
+instruction to that turn's **ephemeral** system prompt:
+
+```yaml
+voice:
+  spoken_reply_hint: >-
+    This reply will be SPOKEN ALOUD, not read. Answer in at most two short
+    sentences, in the user's language. No lists, headings, code blocks, URLs,
+    emoji or markdown — say only what a person would actually say out loud.
+    If the whole answer does not fit, give the essential part and offer the rest.
+```
+
+Set it to `""` to switch it off. Two properties are deliberate:
+
+- **Only on spoken turns.** A typed message in the same chat and the same
+  session is unaffected, so one session can be terse out loud and thorough in
+  writing.
+- **Ephemeral, not cached.** It rides the API-call-time layer described in
+  [prompt assembly](/developer-guide/prompt-assembly), so the cached system
+  prompt prefix stays byte-identical and adding the hint does not invalidate
+  prompt caching.
+
+This is a gateway feature — the CLI voice loop does not apply it.
+
 ### Telegram Voice Bubbles & ffmpeg
 
 Telegram voice bubbles require Opus/OGG audio format:

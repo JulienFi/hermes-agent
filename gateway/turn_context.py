@@ -94,6 +94,11 @@ class TurnContext:
     # topics. Used to stamp platform_message_id on the persisted user turn.
     inbound_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
+    # True when this turn's reply will be spoken aloud (voice input AND
+    # auto-TTS enabled for the chat).  Published by ``_run_agent_inner`` at
+    # the streaming-TTS gate — the one place that already computes it — the
+    # same "assign at the original binding site" rule as ``_status_adapter``.
+    spoken_reply: bool = False
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     # display_kind stamped on the persisted user row at turn start when this

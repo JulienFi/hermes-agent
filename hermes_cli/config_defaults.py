@@ -2022,6 +2022,21 @@ DEFAULT_CONFIG = {
         "submit_mode": "direct",       # TUI: direct submits immediately; draft leaves an editable transcript
         "max_recording_seconds": 120,
         "auto_tts": False,
+        # Extra prompt line used ONLY on messaging-gateway turns whose reply
+        # will be spoken aloud (voice input AND auto-TTS on for that chat).
+        # A reply that is heard has different constraints than one that is
+        # read: no markdown, no lists, and every extra sentence costs the
+        # listener real seconds. It rides the EPHEMERAL prompt layer, so the
+        # cached system-prompt prefix stays byte-identical and text chats in
+        # the same session are untouched. The CLI voice loop does not use it.
+        # Set to "" to disable.
+        "spoken_reply_hint": (
+            "This reply will be SPOKEN ALOUD, not read. Answer in at most "
+            "two short sentences, in the user's language. No lists, "
+            "headings, code blocks, URLs, emoji or markdown — say only what "
+            "a person would actually say out loud. If the whole answer does "
+            "not fit, give the essential part and offer the rest."
+        ),
         # Desktop remote clients call the profile's STT/TTS providers
         # DIRECTLY (config + key fetched over the authenticated REST channel
         # at voice-session start) instead of relaying audio through the

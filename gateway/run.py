@@ -5931,6 +5931,25 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    def _append_spoken_reply_hint(self, ephemeral: str) -> str:
+        """Add the spoken-reply hint when this turn will be heard, not read.
+
+        Appended last so it sits after the platform and channel prompts: it
+        is the most turn-specific instruction of the three.
+
+        This belongs to the EPHEMERAL layer on purpose
+        (``website/docs/developer-guide/prompt-assembly.md``: API-call-time
+        layers are deliberately not persisted into the cached system
+        prompt), so a text turn in the same session still sends the
+        byte-identical cached prefix.
+        """
+        if not self._ctx.spoken_reply:
+            return ephemeral
+        hint = self._runner._spoken_reply_hint()
+        if not hint:
+            return ephemeral
+        return ((ephemeral or "") + "\n\n" + hint).strip()
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -5976,6 +5995,7 @@ class TurnRunner:
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        combined_ephemeral = self._append_spoken_reply_hint(combined_ephemeral)
 
         max_iterations = _current_max_iterations()
 
@@ -8286,6 +8306,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
+
+    def _spoken_reply_hint(self) -> str:
+        """``voice.spoken_reply_hint`` — prompt line for turns that get read aloud.
+
+        Empty string (the documented off switch, or a malformed value) means
+        no hint.  Read per turn rather than snapshotted at startup: the
+        wording is the one knob a user tunes *while listening*.  Via
+        ``load_config_readonly`` — the documented path for read-only callers
+        (no defensive deepcopy, cached on the config file's mtime/size), so
+        the per-turn read costs a dict lookup once the file is unchanged.
+        The returned dict is shared: read it, never mutate it.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly as _load_full_config
+            value = (_load_full_config().get("voice") or {}).get("spoken_reply_hint", "")
+        except Exception as exc:
+            logger.debug("Could not load voice.spoken_reply_hint: %s", exc)
+            return ""
+        return value.strip() if isinstance(value, str) else ""
 
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         """Update an adapter's in-memory auto-TTS suppression set if present."""
@@ -31913,11 +31952,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message_type is not None
             and str(getattr(message_type, "value", message_type)).lower() == "voice"
         )
-        if (
+        # Whether this turn's reply will be spoken rather than read.  The
+        # streaming consumer is one consumer of that fact; run_sync is the
+        # other (spoken-reply prompt hint), so it is computed even when no
+        # streaming provider exists.
+        _reply_is_spoken = bool(
             _stts_adapter is not None
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
-        ):
+        )
+        turn_ctx.spoken_reply = _reply_is_spoken
+        if _reply_is_spoken:
             try:
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer
                 from tools.tts_tool import _load_tts_config
