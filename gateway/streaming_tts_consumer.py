@@ -34,15 +34,25 @@ Design:
   ``completed=False`` but keeps ``suppress_whole_file=True`` so the gateway
   does NOT replay the whole response from the beginning.
 - Cancellation/abort is idempotent: late chunks are silently dropped.
+- Providers with no chunked API (edge — the default — piper, minimax, the
+  command providers) fall back to :class:`SentenceFileStreamer`, which
+  synthesises one clause at a time through the proven sync path and decodes
+  it to PCM. This mirrors what ``stream_tts_to_speaker`` does for the CLI
+  with ``_SyncSentencePipeline``; the sink differs (adapter seam vs local
+  speaker), so each dispatcher owns its own fallback.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import queue
+import shutil
+import subprocess
+import tempfile
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
 
@@ -50,6 +60,126 @@ logger = logging.getLogger("gateway.streaming_tts_consumer")
 
 _ABORT = object()
 _DONE = object()
+
+
+# Upper bound on decoded PCM accepted for one clause. Mirrors
+# ``_STREAM_SENTENCE_BYTE_CAP`` in tools.tts_streaming: a provider or a
+# corrupt file must not be able to feed us unbounded audio.
+_CLAUSE_PCM_BYTE_CAP = 16 * 1024 * 1024
+
+# 48 kHz mono is deliberate. Every platform that can play voice wants 48 kHz
+# (Discord's native rate, and Opus' own), so letting ffmpeg resample once
+# during the decode is both cheaper and better than resampling PCM later in
+# an adapter. Mono keeps the ``StreamingTTSProvider`` contract.
+_FALLBACK_SAMPLE_RATE = 48000
+
+
+class SentenceFileStreamer:
+    """Per-clause sync synthesis, presented as a chunked PCM streamer.
+
+    Satisfies the ``StreamingTTSProvider`` shape (``sample_rate``,
+    ``channels``, ``sample_width``, ``stream(text) -> Iterator[bytes]``)
+    without being registered as a provider: ``resolve_streaming_provider``
+    must keep meaning "a real chunked API is available", and the CLI
+    dispatcher has its own equivalent path.
+
+    Time-to-first-audio is one clause instead of the whole reply. That is
+    worse than a true chunked streamer and far better than waiting for the
+    model to stop generating.
+    """
+
+    channels = 1
+    sample_width = 2
+
+    def __init__(self, tts_config: Dict[str, Any],
+                 sample_rate: int = _FALLBACK_SAMPLE_RATE,
+                 *, decode_timeout: float = 60.0) -> None:
+        self.tts_config = tts_config
+        self.sample_rate = int(sample_rate)
+        self._decode_timeout = float(decode_timeout)
+
+    @staticmethod
+    def available() -> bool:
+        """True when a clause can be synthesised and decoded to PCM."""
+        return shutil.which("ffmpeg") is not None
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        """Synthesise *text*, then yield its PCM as it decodes."""
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".mp3", prefix="hermes_stts_")
+            os.close(fd)
+
+            from tools.tts_tool import text_to_speech_tool
+            text_to_speech_tool(text=text, output_path=tmp_path)
+
+            if not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+                logger.debug("sentence fallback: synthesis produced no audio")
+                return
+
+            yield from self._decode_to_pcm(tmp_path)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _decode_to_pcm(self, path: str) -> Iterator[bytes]:
+        """Stream ffmpeg's PCM output so playback starts before decode ends."""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            return
+        cmd = [
+            ffmpeg, "-nostdin", "-loglevel", "error",
+            "-i", path,
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", str(self.sample_rate), "-ac", str(self.channels),
+            "pipe:1",
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL
+        )
+        total = 0
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _CLAUSE_PCM_BYTE_CAP:
+                    logger.warning(
+                        "sentence fallback: clause exceeded %d PCM bytes, truncating",
+                        _CLAUSE_PCM_BYTE_CAP,
+                    )
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.stdout.close()  # type: ignore[union-attr]
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=self._decode_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            finally:
+                if proc.returncode not in (0, None) and total == 0:
+                    err = b""
+                    try:
+                        err = proc.stderr.read() or b""  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "sentence fallback: ffmpeg exit %s (%s)",
+                        proc.returncode, err.decode("utf-8", "replace").strip()[:200],
+                    )
+                try:
+                    proc.stderr.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
 
 
 class StreamingTTSConsumer:
@@ -73,9 +203,14 @@ class StreamingTTSConsumer:
         self._loop = loop
         self._metadata = metadata
 
-        # Resolve the streaming provider once. If unavailable, the consumer is
-        # inactive and the gateway falls back to whole-file TTS.
+        # Resolve the streaming provider once. When the configured provider
+        # has no chunked API, fall back to per-clause sync synthesis rather
+        # than going inactive — otherwise edge (the default provider) waits
+        # for the whole reply before a single word is spoken.
         self._streamer = resolve_streaming_provider(tts_config)
+        if self._streamer is None and SentenceFileStreamer.available():
+            self._streamer = SentenceFileStreamer(tts_config)
+            logger.debug("streaming TTS: using per-clause sync fallback")
         self._chunker = SentenceChunker()
 
         if self._streamer is not None:
