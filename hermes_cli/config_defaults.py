@@ -2524,6 +2524,19 @@ DEFAULT_CONFIG = {
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
         "voice_playback_timeout_seconds": 120,
+        # Seconds of silence after the last packet before an utterance counts
+        # as finished. Lower = snappier turn-taking; too low and someone who
+        # pauses mid-sentence gets answered halfway through.
+        "voice_silence_threshold_seconds": 1.5,
+        # Let the user talk over the bot: the microphone stays open while it
+        # speaks and the first real speech cuts playback. Needs headphones or
+        # echo cancellation on the speaking client — over open speakers the
+        # bot hears itself and interrupts its own reply.
+        "voice_barge_in": False,
+        # Seconds of live audio that count as "someone is speaking" for
+        # barge-in. Lower reacts faster; too low and a cough or a keyboard
+        # clatter cuts the answer. Capped at 5s.
+        "voice_barge_in_min_speech_seconds": 0.5,
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and
