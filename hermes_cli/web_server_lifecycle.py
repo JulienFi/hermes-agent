@@ -86,7 +86,16 @@ def _valid_parent_start_marker(marker: str) -> bool:
         return False
     if prefix in ("linux", "win", "winms"):
         return value.isdigit()
-    return prefix == "ps"
+    if prefix != "ps":
+        return False
+    # ``ps -o lstart=`` renders as ``Sat Aug 29 15:04:31 2026``. A marker split
+    # on whitespace somewhere in the env plumbing arrives as ``ps:Sat`` -- a
+    # real-looking identity that can never match, so the watchdog would exit a
+    # live backend. Require a full value (#98132).
+    tokens = value.split()
+    has_year = any(token.isdigit() and len(token) == 4 for token in tokens)
+    has_time = any(":" in token for token in tokens)
+    return len(tokens) >= 4 and has_year and has_time
 
 
 def _parent_start_marker_mismatch_is_conclusive(actual: str, expected: str) -> bool:
@@ -293,8 +302,9 @@ def _start_parent_death_watchdog() -> None:
     marker without nonce or vice versa disables the watchdog).
     """
     raw_pid = os.environ.get("HERMES_PARENT_PID")
-    start_marker = os.environ.get("HERMES_PARENT_START_MARKER")
-    nonce = os.environ.get("HERMES_PARENT_NONCE")
+    # Empty inherited values mean "absent", not "marker present but blank".
+    start_marker = os.environ.get("HERMES_PARENT_START_MARKER") or None
+    nonce = os.environ.get("HERMES_PARENT_NONCE") or None
 
     try:
         desktop_pid = int(raw_pid or "")

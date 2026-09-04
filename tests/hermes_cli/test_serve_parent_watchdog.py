@@ -114,3 +114,40 @@ def test_parent_watchdog_still_rejects_recycled_pid_via_stable_linux_marker():
     )
     assert _parent_start_marker_mismatch_is_conclusive("linux:123", "linux:456") is True
     assert _parent_start_marker_mismatch_is_conclusive("win:1", "winms:2") is True
+
+
+def test_macos_ps_marker_requires_full_lstart_not_a_truncated_weekday():
+    """#98132: a whitespace-split ``ps:Sat`` must not arm the watchdog."""
+    assert _valid_parent_start_marker("ps:Sat Aug 29 15:04:31 2026") is True
+    assert _valid_parent_start_marker("ps:Sat") is False
+    assert _valid_parent_start_marker("ps:Sat Aug 29") is False
+
+
+def test_parent_watchdog_treats_empty_marker_env_as_absent(monkeypatch):
+    """Blank inherited HERMES_PARENT_START_MARKER/NONCE degrade to PID-only tracking."""
+    from hermes_cli import web_server_lifecycle
+
+    monkeypatch.setenv("HERMES_PARENT_PID", "4242")
+    monkeypatch.setenv("HERMES_PARENT_START_MARKER", "")
+    monkeypatch.setenv("HERMES_PARENT_NONCE", "")
+    seen = {}
+
+    def fake_orphaned(pid, marker):
+        seen["args"] = (pid, marker)
+        raise SystemExit  # stop the loop thread before it sleeps/exits
+
+    monkeypatch.setattr(web_server_lifecycle, "_is_serve_orphaned", fake_orphaned)
+
+    class _Thread:
+        def __init__(self, target, **_kw):
+            self.target = target
+
+        def start(self):
+            try:
+                self.target()
+            except SystemExit:
+                pass
+
+    monkeypatch.setattr(web_server_lifecycle.threading, "Thread", _Thread)
+    web_server_lifecycle._start_parent_death_watchdog()
+    assert seen["args"] == (4242, None)
