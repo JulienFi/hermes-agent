@@ -566,6 +566,23 @@ class StreamingTTSConsumer:
             except Exception:
                 pass
 
+    def finalisation_timeout(self, grace: float = 10.0, ceiling: float = 120.0) -> float:
+        """How long the gateway may wait for playback after the reply text ended.
+
+        Remaining audio in the adapter plus *grace*, capped at *ceiling* so a
+        wedged player cannot hold the turn open.  Adapters without the
+        ``streaming_tts_pending_seconds`` seam count as "nothing pending".
+        """
+        pending = 0.0
+        if self._handle is not None:
+            probe = getattr(self._adapter, "streaming_tts_pending_seconds", None)
+            if callable(probe):
+                try:
+                    pending = max(0.0, float(probe(self._handle)))
+                except Exception:
+                    pending = 0.0
+        return min(float(ceiling), pending + float(grace))
+
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
         if self._task is None:

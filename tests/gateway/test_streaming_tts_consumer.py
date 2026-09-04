@@ -673,3 +673,57 @@ class TestGatewayOuterFinalisationNoNameError:
         # This is trivially true with a holder, but was NOT true when
         # the consumer was a run_sync local.
         _ = holder[0]
+
+
+# ---------------------------------------------------------------------------
+# Finalisation timeout follows the audio still queued (Discord, 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+class PendingAwareAdapter(FakeVoiceAdapter):
+    """Adapter that reports how much audio it still has to play."""
+
+    def __init__(self, pending_seconds):
+        super().__init__()
+        self.pending_seconds = pending_seconds
+
+    def streaming_tts_pending_seconds(self, handle):
+        return self.pending_seconds
+
+
+class TestFinalisationTimeout:
+    """The gateway waited a fixed 10 s after the reply text ended and then
+    aborted playback — every reply with more than ~10 s of speech left was
+    cut mid-sentence (three of five aborted turns in the 2026-09-04 log)."""
+
+    def _consumer(self, adapter, with_handle=True):
+        loop = asyncio.new_event_loop()
+        try:
+            consumer = _make_consumer(adapter, "chat1", loop, FakeStreamer())
+        finally:
+            loop.close()
+        if with_handle:
+            consumer._handle = StreamingTTSHandle(chat_id="chat1", audio_format=AudioFormat())
+        return consumer
+
+    def test_adapter_without_the_seam_gets_the_grace_only(self):
+        consumer = self._consumer(FakeVoiceAdapter())
+        assert consumer.finalisation_timeout(grace=10.0) == 10.0
+
+    def test_queued_audio_extends_the_wait(self):
+        consumer = self._consumer(PendingAwareAdapter(25.0))
+        assert consumer.finalisation_timeout(grace=10.0) == 35.0
+
+    def test_ceiling_bounds_a_wedged_player(self):
+        consumer = self._consumer(PendingAwareAdapter(500.0))
+        assert consumer.finalisation_timeout(grace=10.0, ceiling=120.0) == 120.0
+
+    def test_without_a_handle_nothing_is_pending(self):
+        consumer = self._consumer(PendingAwareAdapter(25.0), with_handle=False)
+        assert consumer.finalisation_timeout(grace=10.0) == 10.0
+
+    def test_a_failing_probe_does_not_break_finalisation(self):
+        adapter = PendingAwareAdapter(0.0)
+        adapter.streaming_tts_pending_seconds = lambda handle: (_ for _ in ()).throw(RuntimeError("boom"))
+        consumer = self._consumer(adapter)
+        assert consumer.finalisation_timeout(grace=10.0) == 10.0

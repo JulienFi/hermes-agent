@@ -502,3 +502,28 @@ async def test_end_to_end_deltas_become_discord_frames():
     assert written, "no PCM reached the adapter"
     assert consumer.audible is True
     assert consumer.suppress_whole_file is True
+
+
+# ============================================================================
+# Pending-audio seam: the gateway bounds its finalisation wait by this
+# ============================================================================
+
+
+@pytest.mark.asyncio
+class TestPendingSeconds:
+    async def test_pending_seconds_follow_the_buffer(self):
+        adapter = _make_adapter()
+        handle = await adapter.begin_streaming_tts("777", _FMT)
+        # Mono 48 kHz input is doubled to stereo on feed: 48000 samples of
+        # mono become one second of Discord PCM (192000 bytes).
+        await adapter.write_streaming_tts(handle, _pcm(48000))
+
+        assert adapter.streaming_tts_pending_seconds(handle) == pytest.approx(1.0)
+
+        while handle.source.read():
+            pass
+        assert adapter.streaming_tts_pending_seconds(handle) == 0.0
+
+    def test_a_handle_without_a_source_has_nothing_pending(self):
+        adapter = _make_adapter()
+        assert adapter.streaming_tts_pending_seconds(SimpleNamespace()) == 0.0

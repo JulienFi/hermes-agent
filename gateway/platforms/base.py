@@ -4990,6 +4990,16 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    def streaming_tts_pending_seconds(self, handle: StreamingTTSHandle) -> float:
+        """Seconds of audio the adapter has accepted but not yet played out.
+
+        The gateway bounds its finalisation wait by this value: a fixed
+        10 s window cut every reply whose remaining audio was longer than
+        that (Discord, 2026-09-04 — three of five aborted turns).  Default
+        0.0 keeps the old behaviour for adapters that play as they receive.
+        """
+        return 0.0
+
     def _streaming_tts_turn_key(
         self,
         session_key: str | None,

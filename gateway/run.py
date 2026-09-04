@@ -32610,11 +32610,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # audible, suppression is preserved so the gateway does not
             # replay from the beginning; if no audio was audible, the
             # whole-file fallback path is permitted.
+            #
+            # The wait is bounded by the audio still queued in the adapter,
+            # not by a fixed 10 s: TTS synthesises faster than real time, so
+            # a fixed window cut every reply with more than ~10 s of speech
+            # left once the text was complete (Discord, 2026-09-04).
             _stts = streaming_tts_consumer_holder[0]
             if _stts is not None:
                 _stts.finish()
                 try:
-                    await _stts.wait_complete(timeout=10.0)
+                    await _stts.wait_complete(timeout=_stts.finalisation_timeout())
                 except Exception as _stts_done_err:
                     logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
                 if not _stts.done:

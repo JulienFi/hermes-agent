@@ -5074,8 +5074,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Wait for the buffer to actually drain. Bound it by the audio
                 # still queued plus a margin, so a wedged player cannot hold
                 # the turn open.
-                # 192000 = 48 kHz * 2 channels * 2 bytes, Discord's frame rate.
-                pending_seconds = source.pending_bytes / 192000.0
+                pending_seconds = self.streaming_tts_pending_seconds(handle)
                 grace = float(getattr(self, "_streaming_drain_grace", 10.0))
                 await asyncio.wait_for(
                     asyncio.to_thread(source.drained.wait),
@@ -5088,6 +5087,16 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("finish_streaming_tts error (guild=%s): %s", guild_id, e)
         finally:
             self._release_streaming_tts(handle)
+
+    def streaming_tts_pending_seconds(self, handle) -> float:
+        """Seconds of buffered PCM the player has not read yet.
+
+        192000 = 48 kHz * 2 channels * 2 bytes, Discord's native rate.
+        """
+        source = getattr(handle, "source", None)
+        if source is None:
+            return 0.0
+        return float(source.pending_bytes) / 192000.0
 
     async def abort_streaming_tts(self, handle, error: Optional[str] = None) -> None:
         """Drop the stream immediately. Idempotent — late chunks are ignored."""
