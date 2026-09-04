@@ -1290,6 +1290,52 @@ _HALLUCINATION_REPEAT_RE = re.compile(
 )
 
 
+# Repetition loops: Whisper turns real speech into a self-repeating run
+# ("Das ist ja so schoen! Das ist ja so schoen! ..."), which reached
+# production on 2026-09-04 and cost a whole turn — the model answered the
+# loop instead of the question that was actually asked. The phrase list
+# cannot catch this class: the text differs every time. Neither can
+# Whisper's own numbers, both measured on 2026-09-04 against the Groq API:
+# that transcript compresses at ratio 2.08 while openai-whisper's own loop
+# gate only fires at 2.4, and 4s of pure silence came back as "Vielen Dank."
+# with no_speech_prob=0.0 and avg_logprob=-0.28 — maximum confidence in a
+# pure invention. What does separate the classes is the repetition itself:
+# the loop repeats a four-word window three times, while real German speech
+# of the same length stays at one, emphatic "nein nein nein" and list
+# sentences included.
+_REPETITION_NGRAM = 4
+_REPETITION_MAX_REPEATS_DEFAULT = 3
+_REPETITION_WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
+
+
+def _max_ngram_repeats(text: str, size: int = _REPETITION_NGRAM) -> int:
+    """How often the most frequent ``size``-word window occurs in ``text``."""
+    words = [w.lower() for w in _REPETITION_WORD_RE.findall(text)]
+    if len(words) < size:
+        return 0
+    counts: Dict[tuple, int] = {}
+    highest = 0
+    for start in range(len(words) - size + 1):
+        window = tuple(words[start:start + size])
+        counts[window] = counts.get(window, 0) + 1
+        if counts[window] > highest:
+            highest = counts[window]
+    return highest
+
+
+def _repetition_max_repeats() -> int:
+    """``stt.repetition_max_repeats`` (default 3). 0 disables the gate."""
+    try:
+        from hermes_cli.config import load_config
+        stt_cfg = load_config().get("stt", {})
+        if isinstance(stt_cfg, dict):
+            raw = stt_cfg.get("repetition_max_repeats", _REPETITION_MAX_REPEATS_DEFAULT)
+            return max(0, int(raw))
+    except Exception:
+        pass
+    return _REPETITION_MAX_REPEATS_DEFAULT
+
+
 def is_whisper_hallucination(transcript: str) -> bool:
     """Check if a transcript is a known Whisper hallucination on silence."""
     cleaned = transcript.strip().lower()
@@ -1304,6 +1350,10 @@ def is_whisper_hallucination(transcript: str) -> bool:
         return True
     # Repetitive patterns (e.g. "Thank you. Thank you. Thank you. you")
     if _HALLUCINATION_REPEAT_RE.match(cleaned):
+        return True
+    # Language-agnostic repetition loop (see the block above).
+    limit = _repetition_max_repeats()
+    if limit and _max_ngram_repeats(transcript) >= limit:
         return True
     return False
 

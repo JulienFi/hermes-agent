@@ -580,6 +580,51 @@ class TestWhisperHallucinationFilter:
         assert is_whisper_hallucination("Danke, aber wie meinst du das?") is False
         assert is_whisper_hallucination("Okay, also ich bin Kapitän.") is False
 
+    def test_repetition_loop(self):
+        """Whisper loops on real speech, and the loop text is new every time.
+
+        The transcript below reached production on 2026-09-04: the question
+        that was actually asked never arrived, the agent answered the loop.
+        Neither Whisper number would have caught it — measured the same day,
+        it compresses at ratio 2.08 against openai-whisper's own 2.4 gate.
+        """
+        from tools.voice_mode import is_whisper_hallucination
+
+        assert is_whisper_hallucination(
+            "Das ist ja so schön! Das ist ja so schön! Das ist ja so schön! "
+            "Ich bin es ja so schön! Das war's so schön! Das war's für heute."
+        ) is True
+        assert is_whisper_hallucination(
+            "Untertitel der Amara.org-Community Untertitel der Amara.org-Community "
+            "Untertitel der Amara.org-Community"
+        ) is True
+
+    def test_repetition_gate_leaves_real_speech_alone(self):
+        """Emphasis and list sentences repeat words, not four-word windows."""
+        from tools.voice_mode import is_whisper_hallucination
+
+        assert is_whisper_hallucination(
+            "Nein nein nein, das meinte ich nicht, ich meinte das andere."
+        ) is False
+        assert is_whisper_hallucination(
+            "Ich brauche Milch, ich brauche Brot, ich brauche Butter und ich brauche Kaffee."
+        ) is False
+        assert is_whisper_hallucination(
+            "Was hältst du eigentlich von ChatGPT Astra, dem neuen Sprachmodus, "
+            "und wie unterscheidet sich das von dem, was du kannst?"
+        ) is False
+
+    def test_repetition_gate_configurable(self, monkeypatch):
+        """``stt.repetition_max_repeats: 0`` turns the gate off."""
+        import tools.voice_mode as vm
+
+        loop = "Das ist ja so schön! " * 3
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda *a, **k: {"stt": {"repetition_max_repeats": 0}},
+        )
+        assert vm.is_whisper_hallucination(loop) is False
+
     def test_extra_phrases_from_config(self, monkeypatch):
         """``stt.hallucination_phrases`` adds phrases without a code change."""
         import tools.voice_mode as vm
