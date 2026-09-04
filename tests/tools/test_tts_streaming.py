@@ -38,6 +38,51 @@ class TestSentenceChunker:
         assert c.feed("ing</think>The actual spoken answer. ") == ["The actual spoken answer. "]
 
 
+    def test_abbreviation_dot_does_not_cut_the_clause(self):
+        # Measured before the fix: this came out as "... das z.B. " plus
+        # "morgen frueh zu erledigen." — two syntheses, with a full stop and
+        # a pause in the middle of the sentence.
+        c = ts.SentenceChunker()
+        text = "Ich wuerde dir empfehlen, das z.B. morgen frueh zu erledigen."
+        assert c.feed(text) == []
+        assert c.flush() == [text]
+
+    def test_ordinal_and_abbreviation_before_a_capital(self):
+        # Neither "3." nor "usw." can lean on "the next word is lowercase":
+        # a capital follows. The digit and list checks carry them.
+        for text in (
+            "Der wichtigste Termin dieser Woche ist am 3. September um neun.",
+            "Erstens die Miete, zweitens der Strom usw. Das summiert sich.",
+            "Frag am besten Dr. Meier, der kennt den Vorgang seit Jahren.",
+            "Die Rechnung liegt bei ca. 1.200 Euro, das ist mehr als geplant.",
+        ):
+            c = ts.SentenceChunker()
+            c.feed(text)
+            assert c.flush() == [text], text
+
+    def test_initials_are_not_a_sentence_end(self):
+        c = ts.SentenceChunker()
+        text = "Den Vorgang bearbeitet seit Montag A. Meier aus dem Nachbarbuero."
+        assert c.feed(text) == []
+        assert c.flush() == [text]
+
+    def test_a_real_sentence_end_still_cuts_immediately(self):
+        # The whole latency win of streaming TTS rides on cutting at the
+        # first real ".", so the guard must not cost that.
+        c = ts.SentenceChunker()
+        assert c.feed("Der Termin steht am Freitag um neun. Danach") == [
+            "Der Termin steht am Freitag um neun. "
+        ]
+        assert c.flush() == ["Danach"]
+
+    def test_boundary_at_the_end_of_a_delta_is_not_deferred(self):
+        # No next character to look at yet. Cutting is the proven behaviour;
+        # waiting would cost latency on every clause of every reply.
+        c = ts.SentenceChunker()
+        assert c.feed("Das erledige ich heute Abend. ") == [
+            "Das erledige ich heute Abend. "
+        ]
+
     def test_paragraph_break_is_a_boundary(self):
         c = ts.SentenceChunker()
         assert c.feed("A paragraph without punctuation\n\nnext one") == [

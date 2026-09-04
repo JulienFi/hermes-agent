@@ -81,8 +81,62 @@ def take_speech_interrupted() -> bool:
     at, _interrupted_at = _interrupted_at, None
     return at is not None and time.monotonic() - at < _INTERRUPT_TTL_S
 
-# Sentence boundary: after .!? followed by whitespace, or a blank line.
+# Sentence boundary *candidates*: after .!? followed by whitespace, or a
+# blank line. "!" "?" and the blank line are unambiguous; the dot is not, so
+# every candidate is checked by ``_is_sentence_end`` before it cuts speech.
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
+
+# Abbreviations whose trailing dot is not a sentence end — only the residue
+# the structural checks in ``_is_sentence_end`` cannot see (a capital or a
+# dash follows, so "the next word is lowercase" does not fire). German
+# first: that is the language this assistant speaks. Kept deliberately
+# short. A missing entry merges two sentences into one longer clause, which
+# is barely audible; a wrong split is a full stop in the middle of a thought,
+# which every listener notices.
+_ABBREVIATIONS = frozenset("""
+    bspw bzgl bzw ca ggf evtl vgl inkl exkl zzgl sog usw
+    mio mrd tsd nr str abs dipl dr prof
+    d.h u.a u.s.w u.ä o.ä v.a z.b z.t i.d.r
+    approx etc fig e.g i.e vs al
+""".split())
+
+_LEADING_PUNCT_RE = re.compile(r"^\W+", re.UNICODE)
+
+
+def _is_sentence_end(buf: str, start: int, end: int) -> bool:
+    """Is the boundary candidate at ``buf[start:end]`` a real sentence end?
+
+    Four checks, ordered by how far they can be trusted:
+
+    1. ``!``, ``?`` and the blank line never abbreviate anything.
+    2. A digit before the dot is an ordinal, a date or a decimal
+       ("am 3. September", "1.200") — never a sentence end.
+    3. A single letter before the dot is an initial ("A. Meier"); a known
+       abbreviation is one by name ("z.B.", "ca.", "usw.").
+    4. Otherwise: no sentence starts with a lowercase letter, in German or
+       in English. This check alone catches most abbreviations in flowing
+       text; the list above only covers what it cannot see.
+
+    Check 4 needs the character *after* the boundary. When the delta ends
+    right there we do not wait for the next one: cutting is the old, proven
+    behaviour, and checks 2 and 3 still apply. Deferring would trade a rare
+    merge for added latency on every clause of every reply.
+    """
+    head = buf[:start]
+    if not head.endswith("."):
+        return True
+    stem = head[:-1]
+    if not stem.strip():
+        return True
+    if stem[-1].isdigit():
+        return False
+    token = _LEADING_PUNCT_RE.sub("", stem.rsplit(None, 1)[-1])
+    if len(token) == 1 and token.isalpha():
+        return False
+    if token.lower() in _ABBREVIATIONS:
+        return False
+    nxt = buf[end:].lstrip()[:1]
+    return not (nxt and nxt.islower())
 _THINK_BLOCK_RE = re.compile(r"<think[\s>].*?</think>", flags=re.DOTALL)
 
 
@@ -94,6 +148,10 @@ class SentenceChunker:
     ``<think>`` blocks (even split across deltas) and merges fragments shorter
     than *min_len* into the following sentence, so "Ha!" rides along with the
     sentence after it instead of stalling as a tiny clip.
+
+    A dot only cuts when ``_is_sentence_end`` agrees: "das z.B. morgen" is
+    one clause, not two, and a clause spoken with a full stop in the middle
+    of it is the chunking error a listener always hears.
     """
 
     def __init__(self, min_len: int = 20):
@@ -110,6 +168,9 @@ class SentenceChunker:
         while m := SENTENCE_BOUNDARY_RE.search(self.buf, start):
             head = self.buf[: m.end()]
             if len(head.strip()) < self.min_len:
+                start = m.end()
+                continue
+            if not _is_sentence_end(self.buf, m.start(), m.end()):
                 start = m.end()
                 continue
             out.append(head)
