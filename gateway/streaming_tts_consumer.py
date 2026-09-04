@@ -52,6 +52,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Any, Dict, Iterator, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -376,6 +377,12 @@ class StreamingTTSConsumer:
         self._started = True
         self._suppress_whole_file = False
 
+        # Latenzmessung: _t0 laeuft ab dem Moment, in dem der Adapter den
+        # Stream geoeffnet hat.  Die INFO-Zeilen sind das einzige Mittel,
+        # die gefuehlte Antwortzeit eines Sprachzugs serverseitig zu lesen.
+        _t0 = time.monotonic()
+        _clauses = 0
+
         try:
             while True:
                 if self._aborted:
@@ -406,6 +413,20 @@ class StreamingTTSConsumer:
                     self._completed = False
                     await self._safe_abort(str(exc))
                     return
+
+                _clauses += 1
+                if _clauses == 1:
+                    logger.info(
+                        "streaming TTS: first clause audible after %.2fs",
+                        time.monotonic() - _t0,
+                    )
+
+            logger.info(
+                "streaming TTS: %d clause(s) in %.2fs (aborted=%s)",
+                _clauses,
+                time.monotonic() - _t0,
+                self._aborted,
+            )
 
             if not self._aborted and self._handle is not None:
                 _finish_failed = False
