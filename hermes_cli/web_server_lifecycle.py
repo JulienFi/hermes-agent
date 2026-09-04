@@ -89,6 +89,20 @@ def _valid_parent_start_marker(marker: str) -> bool:
     return prefix == "ps"
 
 
+def _parent_start_marker_mismatch_is_conclusive(actual: str, expected: str) -> bool:
+    """Whether a marker mismatch proves the Desktop parent was replaced.
+
+    ``linux:`` jiffies and ``win:``/``winms:`` FILETIME markers are machine
+    values; a mismatch there is PID-reuse evidence. The POSIX fallback (macOS
+    has no ``/proc``) is ``ps -o lstart=`` -- a wall-clock string rendered in
+    the current TZ/locale. Electron caches it once per app lifetime while the
+    backend re-renders it per spawn, so a timezone change (or DST, or column
+    padding) makes the SAME instant differ byte-for-byte. Any ``ps:`` mismatch
+    is therefore inconclusive (#95693, #93958).
+    """
+    return not (actual.startswith("ps:") or expected.startswith("ps:"))
+
+
 def _parent_start_markers_match(actual: str, expected: str) -> bool:
     """Compare parent markers across Desktop generations.
 
@@ -253,7 +267,12 @@ def _is_serve_orphaned(
     try:
         if expected_start_marker is not None:
             probe = process_start_marker or _process_start_marker
-            return not _parent_start_markers_match(probe(int(desktop_pid)), expected_start_marker)
+            actual_marker = probe(int(desktop_pid))
+            if _parent_start_markers_match(actual_marker, expected_start_marker):
+                return False
+            if _parent_start_marker_mismatch_is_conclusive(actual_marker, expected_start_marker):
+                return True
+            # Inconclusive marker: degrade to PID liveness instead of exiting.
 
         if pid_exists is None:
             from gateway.status import _pid_exists
@@ -298,6 +317,14 @@ def _start_parent_death_watchdog() -> None:
     def _loop() -> None:
         while not _is_serve_orphaned(desktop_pid, start_marker):
             time.sleep(poll)
+        try:
+            _log.warning(
+                "Parent-death watchdog: desktop PID %s appears orphaned (expected_start_marker=%r); exiting.",
+                desktop_pid,
+                start_marker,
+            )
+        except Exception:
+            pass
         os._exit(0)
 
     threading.Thread(target=_loop, daemon=True, name="serve-parent-watchdog").start()

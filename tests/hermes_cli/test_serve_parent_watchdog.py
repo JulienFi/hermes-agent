@@ -1,6 +1,10 @@
 """Regression tests for Desktop-owned ``hermes serve`` lifecycle tracking."""
 
-from hermes_cli.web_server_lifecycle import _is_serve_orphaned, _valid_parent_start_marker
+from hermes_cli.web_server_lifecycle import (
+    _is_serve_orphaned,
+    _parent_start_marker_mismatch_is_conclusive,
+    _valid_parent_start_marker,
+)
 
 
 def test_parent_watchdog_tracks_recorded_desktop_pid_not_immediate_ppid():
@@ -57,3 +61,56 @@ def test_parent_watchdog_preserves_legacy_exact_windows_marker():
         )
         is False
     )
+
+
+def test_parent_watchdog_does_not_kill_a_live_parent_on_macos_timezone_drift():
+    """#95693: the SAME instant rendered by `ps -o lstart=` under EDT (cached by
+    Electron before a TZ change) vs CEST (probed by a fresh backend after) must
+    degrade to the PID-only check, not count as proof the parent died."""
+    expected = "ps:Thu Aug 20 22:33:11 2026"
+    actual = "ps:Fri Aug 21 04:33:11 2026"
+
+    assert (
+        _is_serve_orphaned(
+            4242, expected, pid_exists=lambda _pid: True, process_start_marker=lambda _pid: actual
+        )
+        is False
+    )
+
+
+def test_parent_watchdog_still_detects_a_genuinely_dead_parent_despite_ps_marker_mismatch():
+    expected = "ps:Thu Aug 20 22:33:11 2026"
+    actual = "ps:Fri Aug 21 04:33:11 2026"
+
+    assert (
+        _is_serve_orphaned(
+            4242, expected, pid_exists=lambda _pid: False, process_start_marker=lambda _pid: actual
+        )
+        is True
+    )
+
+
+def test_parent_watchdog_exact_ps_marker_match_still_short_circuits():
+    marker = "ps:Thu Aug 20 22:33:11 2026"
+
+    assert (
+        _is_serve_orphaned(
+            4242, marker, pid_exists=lambda _pid: False, process_start_marker=lambda _pid: marker
+        )
+        is False
+    )
+
+
+def test_parent_watchdog_still_rejects_recycled_pid_via_stable_linux_marker():
+    """linux:/win: markers are machine values -- a mismatch stays conclusive."""
+    assert (
+        _is_serve_orphaned(
+            4242,
+            "linux:12345",
+            pid_exists=lambda _pid: True,
+            process_start_marker=lambda _pid: "linux:99999",
+        )
+        is True
+    )
+    assert _parent_start_marker_mismatch_is_conclusive("linux:123", "linux:456") is True
+    assert _parent_start_marker_mismatch_is_conclusive("win:1", "winms:2") is True
