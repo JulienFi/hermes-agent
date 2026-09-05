@@ -503,3 +503,143 @@ async def test_config_is_read_once_not_five_times_a_second():
         await task
 
     assert len(calls) == 1
+
+
+# ============================================================================
+# Level gate — the reason barge-in fired on road noise (2026-09-05)
+# ============================================================================
+
+def _tone(receiver, seconds=1.0, amplitude=8000, ssrc=7, age=0.0):
+    """Fill a buffer with a square wave of the given peak amplitude."""
+    import struct
+
+    frames = int(receiver.SAMPLE_RATE * seconds)
+    sample = struct.pack("<h", amplitude) + struct.pack("<h", -amplitude)
+    receiver._buffers[ssrc] = bytearray(sample * frames)
+    receiver._last_packet_time[ssrc] = time.monotonic() - age
+
+
+class TestPcmDbfs:
+    def test_empty_and_silence_are_minus_infinity(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs
+
+        assert pcm_dbfs(b"") == float("-inf")
+        assert pcm_dbfs(bytes(4000)) == float("-inf")
+
+    def test_full_scale_square_wave_is_zero_dbfs(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs
+
+        r = _make_receiver()
+        _tone(r, seconds=0.1, amplitude=32767)
+        assert pcm_dbfs(bytes(r._buffers[7])) == pytest.approx(0.0, abs=0.01)
+
+    def test_quiet_signal_reads_lower(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs
+
+        r = _make_receiver()
+        _tone(r, seconds=0.1, amplitude=328)  # ~ -40 dBFS
+        assert pcm_dbfs(bytes(r._buffers[7])) == pytest.approx(-40.0, abs=0.1)
+
+    def test_odd_trailing_byte_is_ignored(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs
+
+        assert pcm_dbfs(b"\x00") == float("-inf")
+
+
+class TestSpeechLevelGate:
+    def test_no_gate_keeps_the_packets_only_behaviour(self):
+        r = _make_receiver()
+        _fill(r, seconds=1.0)               # digital silence
+        assert r.speech_in_progress() is True
+
+    def test_noise_below_the_gate_is_not_speech(self):
+        r = _make_receiver()
+        _tone(r, seconds=1.0, amplitude=100)  # ~ -50 dBFS
+        assert r.speech_in_progress(min_dbfs=-40.0) is False
+
+    def test_speech_above_the_gate_cuts(self):
+        r = _make_receiver()
+        _tone(r, seconds=1.0, amplitude=3000)  # ~ -21 dBFS
+        assert r.speech_in_progress(min_dbfs=-40.0) is True
+
+    def test_gate_reads_the_recent_window_not_the_whole_buffer(self):
+        """A long quiet lead-in must not drown the words that follow."""
+        r = _make_receiver()
+        per_second = r.SAMPLE_RATE * r.CHANNELS * 2
+        _tone(r, seconds=0.6, amplitude=3000)
+        loud = bytes(r._buffers[7])
+        r._buffers[7] = bytearray(per_second * 5) + bytearray(loud)
+        assert r.speech_in_progress(min_duration=0.5, min_dbfs=-40.0) is True
+
+    def test_verdict_is_logged_once_per_buffer(self, caplog):
+        import logging
+
+        r = _make_receiver()
+        _tone(r, seconds=1.0, amplitude=100)
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.discord.adapter"):
+            for _ in range(5):
+                r.speech_in_progress(min_dbfs=-40.0)
+        lines = [m for m in caplog.messages if m.startswith("Speech onset")]
+        assert len(lines) == 1
+        assert "ignored" in lines[0]
+
+    def test_verdict_flip_is_logged_again(self, caplog):
+        import logging
+
+        r = _make_receiver()
+        _tone(r, seconds=1.0, amplitude=100)
+        with caplog.at_level(logging.INFO, logger="plugins.platforms.discord.adapter"):
+            r.speech_in_progress(min_dbfs=-40.0)
+            _tone(r, seconds=1.0, amplitude=3000)
+            assert r.speech_in_progress(min_dbfs=-40.0) is True
+        lines = [m for m in caplog.messages if m.startswith("Speech onset")]
+        assert [("speech" in m) for m in lines] == [False, True]
+
+    def test_verdict_is_forgotten_with_the_buffer(self):
+        r = _make_receiver(silence_threshold=0.1)
+        _tone(r, seconds=1.0, amplitude=3000, age=0.2)
+        r.speech_in_progress(min_dbfs=-40.0)
+        r.check_silence()
+        assert r._onset_verdict == {}
+
+
+class TestBargeInMinDbfs:
+    def test_default(self):
+        adapter = _make_adapter()
+        assert adapter._voice_barge_in_min_dbfs() == -40.0
+
+    def test_config_override(self):
+        adapter = _make_adapter({"voice_barge_in_min_dbfs": -33})
+        assert adapter._voice_barge_in_min_dbfs() == -33.0
+
+    @pytest.mark.parametrize("value", [-90, -120, "-100"])
+    def test_at_or_below_minus_ninety_switches_the_gate_off(self, value):
+        adapter = _make_adapter({"voice_barge_in_min_dbfs": value})
+        assert adapter._voice_barge_in_min_dbfs() is None
+
+    @pytest.mark.parametrize("value", [5, "nonsense", None, float("nan"), float("inf")])
+    def test_nonsense_falls_back(self, value):
+        adapter = _make_adapter({"voice_barge_in_min_dbfs": value})
+        assert adapter._voice_barge_in_min_dbfs() == -40.0
+
+
+@pytest.mark.asyncio
+async def test_loop_passes_the_gate_to_the_receiver():
+    adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -35})
+    receiver = MagicMock()
+    receiver._running = True
+    receiver.check_silence.return_value = []
+    receiver.speech_in_progress.return_value = False
+    adapter._voice_receivers[42] = receiver
+    adapter._voice_clients[42] = MagicMock()
+
+    task = asyncio.ensure_future(adapter._voice_listen_loop(42))
+    await asyncio.sleep(0.5)
+    receiver._running = False
+    task.cancel()
+    with __import__("contextlib").suppress(asyncio.CancelledError):
+        await task
+
+    assert receiver.speech_in_progress.called
+    _, kwargs = receiver.speech_in_progress.call_args
+    assert kwargs == {"min_dbfs": -35.0}

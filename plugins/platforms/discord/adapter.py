@@ -627,6 +627,34 @@ def _discord_ready_timeout_seconds() -> float:
     return 30.0
 
 
+def pcm_dbfs(pcm: bytes) -> float:
+    """RMS level of 16-bit little-endian PCM in dBFS (0 = full scale).
+
+    Returns ``-inf`` for an empty or digitally silent buffer.  Used to tell
+    speech from the road noise, fan hum or speaker bleed a phone's own VAD
+    lets through: Discord only sends packets the client thinks are speech,
+    so "packets are arriving" alone is not a speech signal (measured
+    2026-09-05: four barge-ins in six turns, each followed by a 12-character
+    transcript the hallucination filter discarded).
+    """
+    n = len(pcm) - (len(pcm) % 2)
+    if n <= 0:
+        return float("-inf")
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import audioop  # removed in Python 3.13
+        rms = audioop.rms(pcm[:n], 2)
+    except ImportError:
+        import array
+        samples = array.array("h", pcm[:n])[::8]
+        rms = math.sqrt(sum(s * s for s in samples) / max(1, len(samples)))
+    if rms <= 0:
+        return float("-inf")
+    return 20.0 * math.log10(rms / 32768.0)
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -665,6 +693,10 @@ class VoiceReceiver:
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        # Per-SSRC verdict of the last onset check (True = counted as speech),
+        # so the 5 Hz poll logs each buffer once, and again only when the
+        # verdict flips.  Cleared with the buffer.
+        self._onset_verdict: Dict[int, bool] = {}
 
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
@@ -952,15 +984,18 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
+                    self._onset_verdict.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._onset_verdict.pop(ssrc, None)
 
         return completed
 
     def speech_in_progress(self, min_duration: float = 0.5,
-                           max_gap: float = 0.4) -> bool:
+                           max_gap: float = 0.4,
+                           min_dbfs: Optional[float] = None) -> bool:
         """True while somebody is speaking *right now*.
 
         :meth:`check_silence` only reports an utterance once it has ended,
@@ -972,17 +1007,37 @@ class VoiceReceiver:
 
         ``min_duration`` defaults to :attr:`MIN_SPEECH_DURATION` so we only
         cut playback for audio that would actually become an utterance.
+
+        ``min_dbfs`` adds a level gate: the most recent ``min_duration``
+        seconds must reach that RMS level.  Without it, anything the phone's
+        VAD lets through counts — in a car on 2026-09-05 that cut four of
+        six answers after the second word, on noise Whisper later filed as a
+        hallucination.  ``None`` keeps the old packets-only behaviour.
         """
         now = time.monotonic()
         bytes_per_second = self.SAMPLE_RATE * self.CHANNELS * 2
+        window = int(min_duration * bytes_per_second) & ~1
         with self._lock:
             for ssrc, buf in self._buffers.items():
                 last = self._last_packet_time.get(ssrc)
                 if last is None or (now - last) > max_gap:
                     continue
-                if (len(buf) / bytes_per_second) < min_duration:
+                duration = len(buf) / bytes_per_second
+                if duration < min_duration:
                     continue
-                return True
+                if min_dbfs is None:
+                    return True
+                level = pcm_dbfs(bytes(buf[-window:]) if window > 0 else bytes(buf))
+                verdict = level >= min_dbfs
+                if self._onset_verdict.get(ssrc) != verdict:
+                    self._onset_verdict[ssrc] = verdict
+                    logger.info(
+                        "Speech onset: ssrc=%d %.1fs at %.1f dBFS -> %s (gate %.1f dBFS)",
+                        ssrc, duration, level,
+                        "speech" if verdict else "ignored", min_dbfs,
+                    )
+                if verdict:
+                    return True
         return False
 
     def flush_pending(self) -> list:
@@ -1002,6 +1057,7 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                self._onset_verdict.pop(ssrc, None)
 
         return completed
 
@@ -5326,6 +5382,27 @@ class DiscordAdapter(BasePlatformAdapter):
             return VoiceReceiver.MIN_SPEECH_DURATION
         return min(value, 5.0)
 
+    _BARGE_IN_MIN_DBFS_DEFAULT = -40.0
+    _BARGE_IN_MIN_DBFS_OFF = -90.0
+
+    def _voice_barge_in_min_dbfs(self) -> Optional[float]:
+        """RMS level (dBFS) live audio must reach before it cuts playback.
+
+        Config: ``discord.voice_barge_in_min_dbfs``, default -40.  Values at
+        or below -90 switch the gate off (returns ``None``); values above 0
+        or non-numeric fall back to the default.  The default is a starting
+        point, not a measurement: every onset is logged with its level
+        (``Speech onset: ... dBFS``), tune from those lines.
+        """
+        value = self._load_discord_float_config(
+            "voice_barge_in_min_dbfs", self._BARGE_IN_MIN_DBFS_DEFAULT,
+        )
+        if not math.isfinite(value) or value > 0:
+            return self._BARGE_IN_MIN_DBFS_DEFAULT
+        if value <= self._BARGE_IN_MIN_DBFS_OFF:
+            return None
+        return value
+
     def _stop_voice_playback(self, guild_id: int) -> None:
         """Cut whatever TTS is playing in this guild (barge-in)."""
         try:
@@ -5359,6 +5436,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # effect on the next /voice join, same as the silence threshold.
         barge_in = self._voice_barge_in_enabled()
         barge_in_min_speech = self._voice_barge_in_min_speech()
+        barge_in_min_dbfs = self._voice_barge_in_min_dbfs()
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -5366,7 +5444,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Barge-in on speech *onset*. Waiting for the finished
                 # utterance means talking over the user until they stop; this
                 # cuts the answer while they are still mid-sentence.
-                if barge_in and receiver.speech_in_progress(barge_in_min_speech):
+                if barge_in and receiver.speech_in_progress(
+                    barge_in_min_speech, min_dbfs=barge_in_min_dbfs,
+                ):
                     self._stop_voice_playback(guild_id)
 
                 # Send periodic UDP keepalive to prevent Discord from
@@ -5428,10 +5508,21 @@ class DiscordAdapter(BasePlatformAdapter):
             if not result.get("success"):
                 return
             transcript = result.get("transcript", "").strip()
+            seconds = len(pcm_data) / (VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2)
+            level = pcm_dbfs(pcm_data)
             if not transcript or is_whisper_hallucination(transcript):
+                # Silent drops hid the cause of 2026-09-05's false barge-ins:
+                # the audio that cut playback surfaced only as "12 chars".
+                logger.info(
+                    "Voice input dropped as hallucination (%.1fs, %.1f dBFS): %r",
+                    seconds, level, transcript[:60],
+                )
                 return
 
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+            logger.info(
+                "Voice input from user %d (%.1fs, %.1f dBFS): %s",
+                user_id, seconds, level, transcript[:100],
+            )
 
             if self._voice_input_callback:
                 await self._voice_input_callback(

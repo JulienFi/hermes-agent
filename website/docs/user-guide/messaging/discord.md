@@ -353,6 +353,7 @@ discord:
   voice_silence_threshold_seconds: 1.5            # Silence after your last packet that ends an utterance
   voice_barge_in: false                           # Let the user talk over the bot (needs headphones / AEC)
   voice_barge_in_min_speech_seconds: 0.5          # Live audio that counts as "someone is speaking"
+  voice_barge_in_min_dbfs: -40                    # ...and how loud it must be (RMS dBFS); -90 disables the gate
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)
     roles: false                  # @role pings (default: false)
@@ -780,7 +781,7 @@ Notes:
 - Set `voice_channel_inactivity_timeout_seconds: 0` if you want the bot to remain in the voice channel until an explicit `/voice leave` or manual disconnect. The default preserves the historical 300-second idle auto-leave.
 - `voice_playback_timeout_seconds` is a floor, not a hard cap for long TTS. Hermes probes the generated audio duration and waits for `duration + 30s` when that is longer than the configured floor.
 - `voice_silence_threshold_seconds` is how long the receiver waits after your last audio packet before treating the utterance as finished. Raise it if the bot answers while you are still thinking mid-sentence; lower it for snappier turn-taking.
-- `voice_barge_in` keeps the receiver listening *while the bot speaks*, so your first real words cut the answer instead of queueing behind it. It is off by default because over open speakers the bot hears its own voice and interrupts itself — use headphones or a client with echo cancellation. `voice_barge_in_min_speech_seconds` is the guard that keeps a cough or a keyboard clatter from stopping playback.
+- `voice_barge_in` keeps the receiver listening *while the bot speaks*, so your first real words cut the answer instead of queueing behind it. It is off by default because over open speakers the bot hears its own voice and interrupts itself — use headphones or a client with echo cancellation. `voice_barge_in_min_speech_seconds` is the guard that keeps a cough or a keyboard clatter from stopping playback, and `voice_barge_in_min_dbfs` is the level gate: the client's own voice detection passes road noise and speaker bleed as speech, and those are much quieter than words. Every onset is logged as `Speech onset: … dBFS -> speech|ignored`, so you can tune the gate from your own logs.
 - The acknowledgement fires at most once per turn, only when the bot is in a voice channel and the mixer is active. It uses your configured TTS provider.
 - `ambient_path` accepts any file `ffmpeg` can decode; it's looped seamlessly. Leave it empty to use the built-in synthesised pad (no asset needed).
 - All settings live in `config.yaml` (not `.env`) — they're behavioral, not secrets.

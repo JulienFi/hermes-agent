@@ -2552,6 +2552,11 @@ DEFAULT_CONFIG = {
         # barge-in. Lower reacts faster; too low and a cough or a keyboard
         # clatter cuts the answer. Capped at 5s.
         "voice_barge_in_min_speech_seconds": 0.5,
+        # RMS level (dBFS) the live audio must reach before barge-in cuts
+        # playback. A phone's VAD passes road noise and speaker bleed as
+        # "speech"; those sit well below spoken words. -90 or lower turns the
+        # gate off. Tune from the "Speech onset: ... dBFS" log lines.
+        "voice_barge_in_min_dbfs": -40,
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and
