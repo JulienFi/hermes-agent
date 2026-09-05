@@ -17,6 +17,24 @@ from tests.gateway.test_discord_voice_barge_in import (  # noqa: F401 — _patch
 MODEL = os.path.expanduser("~/.hermes/models/silero_vad.onnx")
 needs_model = pytest.mark.skipif(not os.path.isfile(MODEL), reason="silero_vad.onnx not installed")
 
+# "Hallo, kannst du mich hören?" — edge-tts de-DE-KillianNeural, cut to 2.0 s,
+# 16 kHz mono (ffmpeg -ar 16000 -ac 1 -t 2.0), 2026-09-05.  The one input the
+# tone-and-silence tests cannot stand in for: without Silero's 64-sample
+# context the model scored this sentence 0.00 (Codex-Review 2026-09-05).
+SPEECH_WAV = os.path.join(os.path.dirname(__file__), "fixtures", "hallo_de_16k.wav")
+
+
+def _speech_pcm_48k_stereo() -> bytes:
+    """The fixture as Discord PCM: each 16 kHz sample held three times, both channels."""
+    import wave
+
+    import numpy as np
+
+    with wave.open(SPEECH_WAV, "rb") as w:
+        assert (w.getframerate(), w.getnchannels(), w.getsampwidth()) == (16000, 1, 2)
+        mono = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2")
+    return np.repeat(mono, 3).repeat(2).astype("<i2").tobytes()
+
 
 class FakeVAD:
     def __init__(self, ratio):
@@ -69,6 +87,34 @@ class TestSileroModel:
 
     def test_max_window_ratio_on_silence_is_zero(self):
         assert self._vad().max_window_ratio(bytes(192000 * 3), 1.0) == 0.0
+
+    def test_real_speech_is_speech(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter, pcm_dbfs
+
+        vad = self._vad()
+        pcm = _speech_pcm_48k_stereo()
+        assert pcm_dbfs(pcm) > -40.0
+        probs = vad.probabilities(pcm)
+        assert sorted(probs)[len(probs) // 2] > 0.9          # median chunk: clearly speech
+        assert vad.max_window_ratio(pcm, 0.5) >= 0.8
+        # The onset default must let this sentence through its first half second.
+        onset = pcm[: int(0.5 * 192000)]
+        assert vad.speech_ratio(onset) >= DiscordAdapter._BARGE_IN_VAD_MIN_RATIO_DEFAULT
+
+    def test_context_is_carried_between_chunks(self):
+        """A chunk judged alone differs from the same chunk with its predecessor in front."""
+        vad = self._vad()
+        pcm = _speech_pcm_48k_stereo()
+        whole = vad.probabilities(pcm)
+        piece = 512 * 3 * 2 * 2   # one model chunk in source bytes
+        alone = [vad.probabilities(pcm[i:i + piece])[0] for i in range(0, piece * len(whole), piece)]
+        assert alone != whole
+
+    def test_default_path_follows_hermes_home(self, monkeypatch, tmp_path):
+        from plugins.platforms.discord import speech_vad
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        assert speech_vad.default_model_path() == str(tmp_path / "models" / "silero_vad.onnx")
 
     def test_missing_model_returns_none(self, caplog):
         from plugins.platforms.discord.speech_vad import SileroVAD
@@ -169,12 +215,25 @@ class TestClassifierConfig:
         assert adapter._voice_barge_in_vad() is first
 
     def test_min_ratio_default_and_override(self):
-        assert _make_adapter()._voice_barge_in_vad_min_ratio() == 0.6
-        assert _make_adapter({"voice_barge_in_vad_min_ratio": 0.4})._voice_barge_in_vad_min_ratio() == 0.4
+        assert _make_adapter()._voice_barge_in_vad_min_ratio() == 0.4
+        assert _make_adapter({"voice_barge_in_vad_min_ratio": 0.7})._voice_barge_in_vad_min_ratio() == 0.7
 
     @pytest.mark.parametrize("value", [0, 1.5, -1, "x", float("nan")])
     def test_min_ratio_nonsense_falls_back(self, value):
-        assert _make_adapter({"voice_barge_in_vad_min_ratio": value})._voice_barge_in_vad_min_ratio() == 0.6
+        assert _make_adapter({"voice_barge_in_vad_min_ratio": value})._voice_barge_in_vad_min_ratio() == 0.4
+
+    def test_empty_model_path_means_default(self, monkeypatch):
+        from plugins.platforms.discord import speech_vad
+
+        seen = {}
+
+        def fake_load(path, threshold):
+            seen["path"] = path
+            return None
+
+        monkeypatch.setattr(speech_vad.SileroVAD, "load", staticmethod(fake_load))
+        _make_adapter({"voice_barge_in_vad": True, "voice_barge_in_vad_model": ""})._voice_barge_in_vad()
+        assert seen["path"] is None
 
 
 @pytest.mark.asyncio
@@ -203,6 +262,22 @@ async def test_completed_speech_still_cuts_with_classifier():
 
     vc.stop.assert_called_once()
     assert ("max", len(_square(seconds=1.2, amplitude=3000)), adapter._voice_barge_in_min_speech()) in adapter._voice_vad.calls
+
+
+@pytest.mark.asyncio
+async def test_completed_utterance_in_packets_only_mode_skips_the_classifier():
+    """Codex-Review 2026-09-05: -90 dBFS is packets-only in speech_in_progress();
+    the completion fallback must not judge differently."""
+    adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -90, "voice_barge_in_vad": True})
+    adapter._voice_vad = FakeVAD(0.0)
+    vc = _prepare_loop(adapter)
+    receiver = adapter._voice_receivers[42]
+    receiver.check_silence.side_effect = [[(99, _square(seconds=1.2, amplitude=100))]] + [[]] * 200
+
+    await _run_one_listen_pass(adapter)
+
+    vc.stop.assert_called_once()
+    assert adapter._voice_vad.calls == []
 
 
 # ============================================================================

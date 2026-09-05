@@ -5432,14 +5432,18 @@ class DiscordAdapter(BasePlatformAdapter):
     _BARGE_IN_MIN_DBFS_DEFAULT = -40.0
     _BARGE_IN_MIN_DBFS_OFF = -90.0
     _BARGE_IN_VAD_THRESHOLD_DEFAULT = 0.6   # per-chunk speech probability
-    _BARGE_IN_VAD_MIN_RATIO_DEFAULT = 0.6   # share of speech chunks in the window
+    # 0.4 of a 0.5 s window = 200 ms of speech-classified audio, the onset
+    # length the production stacks use; a synthesised sentence scored 0.47
+    # over its first half second (leading pause included), so 0.6 would
+    # have rejected it.
+    _BARGE_IN_VAD_MIN_RATIO_DEFAULT = 0.4
 
     def _voice_barge_in_vad(self):
         """The Silero classifier behind the level gate, or ``None``.
 
         Config: ``discord.voice_barge_in_vad`` (default on),
-        ``discord.voice_barge_in_vad_model`` (path, default
-        ``~/.hermes/models/silero_vad.onnx``), ``discord.voice_barge_in_vad_threshold``
+        ``discord.voice_barge_in_vad_model`` (path; empty means
+        ``<hermes home>/models/silero_vad.onnx``), ``discord.voice_barge_in_vad_threshold``
         (per-chunk probability, default 0.6).  Loaded once per adapter and
         reused across voice sessions; a missing model logs once and leaves
         the level gate alone.
@@ -5540,8 +5544,14 @@ class DiscordAdapter(BasePlatformAdapter):
         barge_in_vad_ratio = self._voice_barge_in_vad_min_ratio()
 
         def _completed_is_speech(pcm: bytes) -> bool:
-            """Same gates as the onset check, judged by the loudest window."""
-            if barge_in_min_dbfs is not None and pcm_peak_window_dbfs(pcm, gate_window) < barge_in_min_dbfs:
+            """Same gates as the onset check, judged by the loudest window.
+
+            Runs in a worker thread (see the call site): a long utterance
+            means ~31 ONNX passes per audio second.
+            """
+            if barge_in_min_dbfs is None:
+                return True     # packets-only mode, as in speech_in_progress()
+            if pcm_peak_window_dbfs(pcm, gate_window) < barge_in_min_dbfs:
                 return False
             if barge_in_vad is None:
                 return True
@@ -5557,7 +5567,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Barge-in on speech *onset*. Waiting for the finished
                 # utterance means talking over the user until they stop; this
                 # cuts the answer while they are still mid-sentence.
-                if barge_in and receiver.speech_in_progress(
+                # Off the event loop: the check runs RMS and, with the
+                # classifier, ~15 ONNX passes per poll (Codex-Review 2026-09-05).
+                if barge_in and await asyncio.to_thread(
+                    receiver.speech_in_progress,
                     barge_in_min_speech, min_dbfs=barge_in_min_dbfs,
                 ):
                     self._stop_voice_playback(guild_id)
@@ -5596,7 +5609,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # that failed the gate would still cut playback here;
                     # judged by the loudest onset-sized window, not the mean
                     # (Codex-Review 2026-09-05, both rounds).
-                    if barge_in and _completed_is_speech(pcm_data):
+                    if barge_in and await asyncio.to_thread(_completed_is_speech, pcm_data):
                         self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the
                     # bot's own playback. Reset the inactivity timer so an active

@@ -2562,9 +2562,9 @@ DEFAULT_CONFIG = {
         # voice_barge_in_vad_model (see plugins/platforms/discord/speech_vad.py
         # for the download); without it the level gate decides alone.
         "voice_barge_in_vad": True,
-        "voice_barge_in_vad_model": "~/.hermes/models/silero_vad.onnx",
+        "voice_barge_in_vad_model": "",        # empty = <hermes home>/models/silero_vad.onnx
         "voice_barge_in_vad_threshold": 0.6,   # per 32 ms chunk: speech probability
-        "voice_barge_in_vad_min_ratio": 0.6,   # share of speech chunks in the onset window
+        "voice_barge_in_vad_min_ratio": 0.4,   # share of speech chunks in the onset window (0.4 * 0.5 s = 200 ms)
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

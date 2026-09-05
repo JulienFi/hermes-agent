@@ -11,12 +11,18 @@ gate for exactly this reason (researched 2026-09-05).
 Runs on ``onnxruntime`` + ``numpy`` (both in the Hermes venv); torch is not
 needed.  The model file is not part of the repository:
 
-    curl -L -o ~/.hermes/models/silero_vad.onnx \\
+    curl -L -o "$HERMES_HOME/models/silero_vad.onnx" \\
       https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 
-(2 327 524 bytes, sha256 1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3,
-fetched 2026-09-05).  Without it :meth:`SileroVAD.load` returns ``None`` and
-the caller keeps the level gate alone.
+(default home ``~/.hermes``; 2 327 524 bytes, sha256
+1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3, fetched
+2026-09-05).  Without it :meth:`SileroVAD.load` returns ``None`` and the
+caller keeps the level gate alone.
+
+Measured on a synthesised German sentence (edge-tts, 2026-09-05): speech
+chunks score a median probability of 1.0, a 1 kHz tone at -12 dBFS and
+silence score 0.0 throughout; over the whole sentence 57 % of chunks pass
+0.6 because of the pauses, over the first half second 47 %.
 """
 
 from __future__ import annotations
@@ -28,9 +34,23 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_PATH = "~/.hermes/models/silero_vad.onnx"
 MODEL_RATE = 16000          # the ONNX model accepts 8 or 16 kHz
 CHUNK = 512                 # samples per inference at 16 kHz = 32 ms
+# Silero v5 streaming protocol: each call gets the last CONTEXT samples of
+# the previous chunk in front of the new CHUNK samples (576 in, 512 new).
+# The recurrent ``state`` does not replace this waveform context — without
+# it the model returned ~0 for a real German sentence (measured
+# 2026-09-05, Codex-Review), i.e. speech never counted as speech.
+CONTEXT = 64
+
+
+def default_model_path() -> str:
+    """``<hermes home>/models/silero_vad.onnx`` — follows HERMES_HOME and profiles."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home() / "models" / "silero_vad.onnx")
+    except Exception:
+        return os.path.expanduser("~/.hermes/models/silero_vad.onnx")
 SOURCE_RATE = 48000         # Discord PCM: 48 kHz, stereo, s16le
 SOURCE_CHANNELS = 2
 
@@ -61,7 +81,7 @@ class SileroVAD:
     def load(cls, model_path: Optional[str] = None,
              threshold: float = 0.6) -> Optional["SileroVAD"]:
         """Return a ready classifier, or ``None`` (logged once) if it cannot run."""
-        path = os.path.expanduser(model_path or DEFAULT_MODEL_PATH)
+        path = os.path.expanduser(model_path or default_model_path())
         if not os.path.isfile(path):
             logger.warning(
                 "Silero VAD model not found at %s — barge-in falls back to the "
@@ -103,13 +123,16 @@ class SileroVAD:
         if chunks == 0:
             return []
         state = np.zeros((2, 1, 128), dtype=np.float32)
+        context = np.zeros(CONTEXT, dtype=np.float32)
         sr = np.array(MODEL_RATE, dtype=np.int64)
         probs: List[float] = []
         with self._lock:
             for i in range(chunks):
-                x = audio[i * CHUNK:(i + 1) * CHUNK][None, :]
+                chunk = audio[i * CHUNK:(i + 1) * CHUNK]
+                x = np.concatenate([context, chunk])[None, :]
                 out, state = self._session.run(None, {"input": x, "state": state, "sr": sr})
                 probs.append(float(out[0][0]))
+                context = chunk[-CONTEXT:]
         return probs
 
     def speech_ratio(self, pcm: bytes) -> float:
