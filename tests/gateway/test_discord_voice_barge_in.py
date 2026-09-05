@@ -37,6 +37,10 @@ def _make_adapter(extra=None):
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     _DISCORD_BLOCK.clear()
+    # The classifier is off here so these tests measure the level gate and
+    # not whether ~/.hermes/models/silero_vad.onnx happens to be installed;
+    # test_discord_speech_vad.py switches it on explicitly.
+    _DISCORD_BLOCK["voice_barge_in_vad"] = False
     _DISCORD_BLOCK.update(extra or {})
 
     adapter = object.__new__(DiscordAdapter)

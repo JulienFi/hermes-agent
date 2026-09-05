@@ -2557,6 +2557,14 @@ DEFAULT_CONFIG = {
         # "speech"; those sit well below spoken words. -90 or lower turns the
         # gate off. Tune from the "Speech onset: ... dBFS" log lines.
         "voice_barge_in_min_dbfs": -40,
+        # Silero VAD (ONNX) behind the level gate: judges speech by structure,
+        # not loudness, so no per-device calibration. Needs the model file at
+        # voice_barge_in_vad_model (see plugins/platforms/discord/speech_vad.py
+        # for the download); without it the level gate decides alone.
+        "voice_barge_in_vad": True,
+        "voice_barge_in_vad_model": "~/.hermes/models/silero_vad.onnx",
+        "voice_barge_in_vad_threshold": 0.6,   # per 32 ms chunk: speech probability
+        "voice_barge_in_vad_min_ratio": 0.6,   # share of speech chunks in the onset window
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

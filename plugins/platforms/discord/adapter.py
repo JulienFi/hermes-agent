@@ -690,9 +690,15 @@ class VoiceReceiver:
     CHANNELS = 2               # Discord sends stereo
 
     def __init__(self, voice_client, allowed_user_ids: set = None,
-                 silence_threshold: Optional[float] = None):
+                 silence_threshold: Optional[float] = None,
+                 vad=None, vad_min_ratio: float = 0.6):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        # Optional speech classifier (plugins/platforms/discord/speech_vad.py)
+        # behind the level gate: an object with ``speech_ratio(pcm) -> float``.
+        # ``None`` keeps the level gate alone.
+        self._vad = vad
+        self._vad_min_ratio = float(vad_min_ratio)
         # Per-instance end-of-utterance window. The 1.5s class default cuts
         # a speaker off mid-thought whenever they pause to think; a Discord
         # session on 2026-09-03 lost seven sentences to it and the user had
@@ -1033,10 +1039,16 @@ class VoiceReceiver:
         VAD lets through counts — in a car on 2026-09-05 that cut four of
         six answers after the second word, on noise Whisper later filed as a
         hallucination.  ``None`` keeps the old packets-only behaviour.
+
+        With a classifier (``vad`` at construction) the window must also
+        contain at least ``vad_min_ratio`` speech-classified chunks.  The
+        level gate stays in front as the cheap filter; the classifier is what
+        makes the verdict device-independent.
         """
         now = time.monotonic()
         bytes_per_second = self.SAMPLE_RATE * self.CHANNELS * 2
         window = int(min_duration * bytes_per_second) & ~1
+        candidates = []
         with self._lock:
             for ssrc, buf in self._buffers.items():
                 last = self._last_packet_time.get(ssrc)
@@ -1047,17 +1059,30 @@ class VoiceReceiver:
                     continue
                 if min_dbfs is None:
                     return True
-                level = pcm_dbfs(bytes(buf[-window:]) if window > 0 else bytes(buf))
-                verdict = level >= min_dbfs
-                if self._onset_verdict.get(ssrc) != verdict:
-                    self._onset_verdict[ssrc] = verdict
-                    logger.info(
-                        "Speech onset: ssrc=%d %.1fs at %.1f dBFS -> %s (gate %.1f dBFS)",
-                        ssrc, duration, level,
-                        "speech" if verdict else "ignored", min_dbfs,
-                    )
-                if verdict:
-                    return True
+                candidates.append((ssrc, duration, bytes(buf[-window:]) if window > 0 else bytes(buf)))
+        # Level and classifier run outside the lock: the packet thread must
+        # not wait on an ONNX pass.
+        for ssrc, duration, recent in candidates:
+            level = pcm_dbfs(recent)
+            verdict = level >= min_dbfs
+            ratio = None
+            if verdict and self._vad is not None:
+                try:
+                    ratio = float(self._vad.speech_ratio(recent))
+                except Exception as e:
+                    logger.debug("VAD failed, level gate decides: %s", e)
+                else:
+                    verdict = ratio >= self._vad_min_ratio
+            if self._onset_verdict.get(ssrc) != verdict:
+                self._onset_verdict[ssrc] = verdict
+                logger.info(
+                    "Speech onset: ssrc=%d %.1fs at %.1f dBFS vad=%s -> %s (gate %.1f dBFS, vad>=%.2f)",
+                    ssrc, duration, level,
+                    "n/a" if ratio is None else f"{ratio:.2f}",
+                    "speech" if verdict else "ignored", min_dbfs, self._vad_min_ratio,
+                )
+            if verdict:
+                return True
         return False
 
     def flush_pending(self) -> list:
@@ -4807,6 +4832,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     vc,
                     allowed_user_ids=self._allowed_user_ids,
                     silence_threshold=self._voice_silence_threshold(),
+                    vad=self._voice_barge_in_vad(),
+                    vad_min_ratio=self._voice_barge_in_vad_min_ratio(),
                 )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
@@ -5404,6 +5431,55 @@ class DiscordAdapter(BasePlatformAdapter):
 
     _BARGE_IN_MIN_DBFS_DEFAULT = -40.0
     _BARGE_IN_MIN_DBFS_OFF = -90.0
+    _BARGE_IN_VAD_THRESHOLD_DEFAULT = 0.6   # per-chunk speech probability
+    _BARGE_IN_VAD_MIN_RATIO_DEFAULT = 0.6   # share of speech chunks in the window
+
+    def _voice_barge_in_vad(self):
+        """The Silero classifier behind the level gate, or ``None``.
+
+        Config: ``discord.voice_barge_in_vad`` (default on),
+        ``discord.voice_barge_in_vad_model`` (path, default
+        ``~/.hermes/models/silero_vad.onnx``), ``discord.voice_barge_in_vad_threshold``
+        (per-chunk probability, default 0.6).  Loaded once per adapter and
+        reused across voice sessions; a missing model logs once and leaves
+        the level gate alone.
+        """
+        if not self._load_discord_bool_config("voice_barge_in_vad", True):
+            return None
+        cached = getattr(self, "_voice_vad", None)
+        if cached is not None:
+            return cached
+        if getattr(self, "_voice_vad_failed", False):
+            return None
+        try:
+            from plugins.platforms.discord.speech_vad import SileroVAD
+            from hermes_cli.config import read_raw_config
+            cfg = (read_raw_config() or {}).get("discord") or {}
+            path = cfg.get("voice_barge_in_vad_model") or None
+        except Exception as e:
+            logger.warning("Silero VAD unavailable (%s) — level gate alone", e)
+            self._voice_vad_failed = True
+            return None
+        threshold = self._load_discord_float_config(
+            "voice_barge_in_vad_threshold", self._BARGE_IN_VAD_THRESHOLD_DEFAULT,
+        )
+        if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+            threshold = self._BARGE_IN_VAD_THRESHOLD_DEFAULT
+        vad = SileroVAD.load(path, threshold)
+        if vad is None:
+            self._voice_vad_failed = True
+            return None
+        self._voice_vad = vad
+        return vad
+
+    def _voice_barge_in_vad_min_ratio(self) -> float:
+        """Share of the window that must classify as speech (``discord.voice_barge_in_vad_min_ratio``)."""
+        value = self._load_discord_float_config(
+            "voice_barge_in_vad_min_ratio", self._BARGE_IN_VAD_MIN_RATIO_DEFAULT,
+        )
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            return self._BARGE_IN_VAD_MIN_RATIO_DEFAULT
+        return value
 
     def _voice_barge_in_min_dbfs(self) -> Optional[float]:
         """RMS level (dBFS) live audio must reach before it cuts playback.
@@ -5460,6 +5536,20 @@ class DiscordAdapter(BasePlatformAdapter):
         gate_window = int(
             barge_in_min_speech * VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2
         )
+        barge_in_vad = self._voice_barge_in_vad() if barge_in else None
+        barge_in_vad_ratio = self._voice_barge_in_vad_min_ratio()
+
+        def _completed_is_speech(pcm: bytes) -> bool:
+            """Same gates as the onset check, judged by the loudest window."""
+            if barge_in_min_dbfs is not None and pcm_peak_window_dbfs(pcm, gate_window) < barge_in_min_dbfs:
+                return False
+            if barge_in_vad is None:
+                return True
+            try:
+                return float(barge_in_vad.max_window_ratio(pcm, barge_in_min_speech)) >= barge_in_vad_ratio
+            except Exception as e:
+                logger.debug("VAD failed on completed utterance, level gate decides: %s", e)
+                return True
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -5506,10 +5596,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # that failed the gate would still cut playback here;
                     # judged by the loudest onset-sized window, not the mean
                     # (Codex-Review 2026-09-05, both rounds).
-                    if barge_in and (
-                        barge_in_min_dbfs is None
-                        or pcm_peak_window_dbfs(pcm_data, gate_window) >= barge_in_min_dbfs
-                    ):
+                    if barge_in and _completed_is_speech(pcm_data):
                         self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the
                     # bot's own playback. Reset the inactivity timer so an active
@@ -5522,6 +5609,22 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
+    # Whisper hallucinates most on very short clips: a 1.0 s "Hallo" came
+    # back as "Bis zum nächsten Mal." on 2026-09-05 and was filtered away,
+    # so the first message of the session never arrived.  Clips shorter than
+    # STT_PAD_BELOW_SECONDS get STT_PAD_SECONDS of silence on both ends
+    # before transcription — the decoder gets context, not more words.
+    STT_PAD_BELOW_SECONDS = 1.5
+    STT_PAD_SECONDS = 0.5
+
+    @classmethod
+    def _pad_short_clip(cls, pcm_data: bytes) -> bytes:
+        per_second = VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2
+        if len(pcm_data) >= cls.STT_PAD_BELOW_SECONDS * per_second:
+            return pcm_data
+        pad = b"\x00" * (int(cls.STT_PAD_SECONDS * per_second) & ~3)
+        return pad + pcm_data + pad
+
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
@@ -5530,7 +5633,7 @@ class DiscordAdapter(BasePlatformAdapter):
         wav_path = tmp_f.name
         tmp_f.close()
         try:
-            await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
+            await asyncio.to_thread(VoiceReceiver.pcm_to_wav, self._pad_short_clip(pcm_data), wav_path)
 
             from tools.transcription_tools import transcribe_audio
             result = await asyncio.to_thread(transcribe_audio, wav_path)
