@@ -573,15 +573,53 @@ class StreamingTTSConsumer:
         wedged player cannot hold the turn open.  Adapters without the
         ``streaming_tts_pending_seconds`` seam count as "nothing pending".
         """
-        pending = 0.0
-        if self._handle is not None:
-            probe = getattr(self._adapter, "streaming_tts_pending_seconds", None)
-            if callable(probe):
-                try:
-                    pending = max(0.0, float(probe(self._handle)))
-                except Exception:
-                    pending = 0.0
-        return min(float(ceiling), pending + float(grace))
+        return min(float(ceiling), self._pending_seconds() + float(grace))
+
+    def _pending_seconds(self) -> float:
+        """Audio the adapter has accepted but not played yet, 0 without a seam."""
+        if self._handle is None:
+            return 0.0
+        probe = getattr(self._adapter, "streaming_tts_pending_seconds", None)
+        if not callable(probe):
+            return 0.0
+        try:
+            return max(0.0, float(probe(self._handle)))
+        except Exception:
+            return 0.0
+
+    async def wait_finalised(self, grace: float = 10.0, ceiling: float = 120.0,
+                             poll: float = 0.5) -> bool:
+        """Wait for the drain task, re-reading the remaining audio as it grows.
+
+        :meth:`finalisation_timeout` is a snapshot.  Taken right after
+        :meth:`finish`, it sees only the audio already fed — the flushed
+        tail clause is still being synthesised, and for a two-clause reply
+        that tail is most of the speech.  The snapshot then bounded the wait
+        by "a few seconds plus grace" and the reply was cut once more
+        (Discord, 2026-09-05: three turns aborted 14 s after their last
+        clause, ~8 s of speech each still queued).  So the deadline is
+        recomputed while waiting and extended whenever *more* audio turns
+        up — not on every poll, or a silent stall would extend itself by
+        ``grace`` forever — and never past ``ceiling`` from the start.
+        Returns the drain result.
+        """
+        start = time.monotonic()
+        hard = start + float(ceiling)
+        seen = self._pending_seconds()
+        deadline = min(hard, start + seen + float(grace))
+        while True:
+            if self.done:
+                return self._completed
+            now = time.monotonic()
+            if now >= deadline:
+                return self._completed
+            await self.wait_complete(timeout=max(0.0, min(float(poll), deadline - now)))
+            if self.done:
+                return self._completed
+            pending = self._pending_seconds()
+            if pending > seen:
+                seen = pending
+                deadline = min(hard, max(deadline, time.monotonic() + pending + float(grace)))
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""

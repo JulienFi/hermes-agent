@@ -727,3 +727,72 @@ class TestFinalisationTimeout:
         adapter.streaming_tts_pending_seconds = lambda handle: (_ for _ in ()).throw(RuntimeError("boom"))
         consumer = self._consumer(adapter)
         assert consumer.finalisation_timeout(grace=10.0) == 10.0
+
+
+class TestWaitFinalised:
+    """The snapshot taken right after finish() misses the tail clause that
+    is still being synthesised (Discord, 2026-09-05: three replies cut 14 s
+    after their last clause with ~8 s of speech left)."""
+
+    def _live_consumer(self, adapter):
+        consumer = _make_consumer(adapter, "chat1", asyncio.get_running_loop(), FakeStreamer())
+        consumer._handle = StreamingTTSHandle(chat_id="chat1", audio_format=AudioFormat())
+        return consumer
+
+    def test_audio_fed_after_finish_extends_the_wait(self):
+        async def run(loop):
+            adapter = PendingAwareAdapter(0.0)
+            consumer = self._live_consumer(adapter)
+
+            async def drain():
+                await asyncio.sleep(0.2)          # tail clause synthesised...
+                adapter.pending_seconds = 1.5     # ...and fed: now there is audio
+                await asyncio.sleep(0.7)          # it plays out
+                consumer._completed = True
+
+            consumer._task = asyncio.ensure_future(drain())
+            started = time.monotonic()
+            ok = await consumer.wait_finalised(grace=0.3, ceiling=10.0, poll=0.05)
+            assert ok is True
+            assert time.monotonic() - started >= 0.85   # a 0.3 s snapshot would have quit at 0.3 s
+
+        _run_test(run)
+
+    def test_no_audio_and_no_end_gives_up_after_grace(self):
+        async def run(loop):
+            consumer = self._live_consumer(PendingAwareAdapter(0.0))
+            consumer._task = asyncio.ensure_future(asyncio.sleep(10))
+            started = time.monotonic()
+            ok = await consumer.wait_finalised(grace=0.3, ceiling=10.0, poll=0.05)
+            consumer._task.cancel()
+            assert ok is False
+            assert 0.25 <= time.monotonic() - started < 1.0
+
+        _run_test(run)
+
+    def test_ceiling_still_caps_a_wedged_player(self):
+        async def run(loop):
+            consumer = self._live_consumer(PendingAwareAdapter(500.0))
+            consumer._task = asyncio.ensure_future(asyncio.sleep(10))
+            started = time.monotonic()
+            ok = await consumer.wait_finalised(grace=0.1, ceiling=0.5, poll=0.05)
+            consumer._task.cancel()
+            assert ok is False
+            assert 0.45 <= time.monotonic() - started < 1.5
+
+        _run_test(run)
+
+    def test_finished_task_returns_at_once(self):
+        async def run(loop):
+            consumer = self._live_consumer(PendingAwareAdapter(500.0))
+
+            async def instant():
+                consumer._completed = True
+
+            consumer._task = asyncio.ensure_future(instant())
+            await asyncio.sleep(0)
+            started = time.monotonic()
+            assert await consumer.wait_finalised(grace=10.0) is True
+            assert time.monotonic() - started < 0.5
+
+        _run_test(run)
