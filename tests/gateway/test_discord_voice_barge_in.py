@@ -623,6 +623,38 @@ class TestBargeInMinDbfs:
         assert adapter._voice_barge_in_min_dbfs() == -40.0
 
 
+def _square(seconds=0.6, amplitude=8000):
+    import struct
+
+    return (struct.pack("<h", amplitude) + struct.pack("<h", -amplitude)) * int(48000 * seconds)
+
+
+@pytest.mark.asyncio
+async def test_completed_quiet_utterance_does_not_cut_playback():
+    """Codex-Review 2026-09-05: the fallback stop bypassed the level gate."""
+    adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -40})
+    vc = _prepare_loop(adapter)
+    receiver = adapter._voice_receivers[42]
+    receiver.check_silence.side_effect = [[(99, _square(amplitude=100))]] + [[]] * 200  # ~ -50 dBFS
+
+    await _run_one_listen_pass(adapter)
+
+    vc.stop.assert_not_called()
+    assert len(adapter._processed) == 1      # still transcribed, just not a barge-in
+
+
+@pytest.mark.asyncio
+async def test_completed_loud_utterance_still_cuts_playback():
+    adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -40})
+    vc = _prepare_loop(adapter)
+    receiver = adapter._voice_receivers[42]
+    receiver.check_silence.side_effect = [[(99, _square(amplitude=3000))]] + [[]] * 200  # ~ -21 dBFS
+
+    await _run_one_listen_pass(adapter)
+
+    vc.stop.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_loop_passes_the_gate_to_the_receiver():
     adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -35})

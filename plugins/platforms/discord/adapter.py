@@ -5479,7 +5479,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     # over the answer to the new one.
                     # Belt and braces: the onset check above normally fired
                     # already, but a very short utterance can slip past it.
-                    if barge_in:
+                    # Same level gate as the onset, or a quiet noise burst
+                    # that failed the gate would still cut playback here
+                    # (Codex-Review 2026-09-05).
+                    if barge_in and (
+                        barge_in_min_dbfs is None
+                        or pcm_dbfs(pcm_data) >= barge_in_min_dbfs
+                    ):
                         self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the
                     # bot's own playback. Reset the inactivity timer so an active
