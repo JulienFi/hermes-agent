@@ -655,6 +655,26 @@ def pcm_dbfs(pcm: bytes) -> float:
     return 20.0 * math.log10(rms / 32768.0)
 
 
+def pcm_peak_window_dbfs(pcm: bytes, window: int) -> float:
+    """Loudest ``window``-byte stretch of ``pcm`` in dBFS (hop = half window).
+
+    The onset gate reads the most recent window of a live buffer; a finished
+    utterance has no "most recent", and averaging the whole recording lets a
+    quiet lead-in drown the words that follow (Codex-Review 2026-09-05:
+    5 s at −50 dBFS plus 0.6 s at −35 dBFS averages to −43.6).  So the
+    finished utterance is judged by its loudest window instead.
+    """
+    window = max(2, window & ~1)
+    if len(pcm) <= window:
+        return pcm_dbfs(pcm)
+    hop = max(2, (window // 2) & ~1)
+    best = float("-inf")
+    for start in range(0, len(pcm) - window + 1, hop):
+        best = max(best, pcm_dbfs(pcm[start:start + window]))
+    tail = pcm[-window:]
+    return max(best, pcm_dbfs(tail))
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -5437,6 +5457,9 @@ class DiscordAdapter(BasePlatformAdapter):
         barge_in = self._voice_barge_in_enabled()
         barge_in_min_speech = self._voice_barge_in_min_speech()
         barge_in_min_dbfs = self._voice_barge_in_min_dbfs()
+        gate_window = int(
+            barge_in_min_speech * VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2
+        )
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -5480,11 +5503,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Belt and braces: the onset check above normally fired
                     # already, but a very short utterance can slip past it.
                     # Same level gate as the onset, or a quiet noise burst
-                    # that failed the gate would still cut playback here
-                    # (Codex-Review 2026-09-05).
+                    # that failed the gate would still cut playback here;
+                    # judged by the loudest onset-sized window, not the mean
+                    # (Codex-Review 2026-09-05, both rounds).
                     if barge_in and (
                         barge_in_min_dbfs is None
-                        or pcm_dbfs(pcm_data) >= barge_in_min_dbfs
+                        or pcm_peak_window_dbfs(pcm_data, gate_window) >= barge_in_min_dbfs
                     ):
                         self._stop_voice_playback(guild_id)
                     # A user speaking to the bot is activity too — not just the

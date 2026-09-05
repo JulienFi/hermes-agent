@@ -643,6 +643,48 @@ async def test_completed_quiet_utterance_does_not_cut_playback():
     assert len(adapter._processed) == 1      # still transcribed, just not a barge-in
 
 
+class TestPeakWindowDbfs:
+    def test_short_buffer_is_the_plain_level(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs, pcm_peak_window_dbfs
+
+        pcm = _square(seconds=0.1, amplitude=3000)
+        assert pcm_peak_window_dbfs(pcm, 192000) == pytest.approx(pcm_dbfs(pcm))
+
+    def test_loud_tail_after_quiet_lead_in_wins(self):
+        from plugins.platforms.discord.adapter import pcm_dbfs, pcm_peak_window_dbfs
+
+        pcm = _square(seconds=5.0, amplitude=100) + _square(seconds=0.6, amplitude=600)
+        window = int(0.5 * 192000)
+        assert pcm_dbfs(pcm) < -40.0                       # the mean would fail the gate
+        assert pcm_peak_window_dbfs(pcm, window) > -40.0   # the loudest window passes
+
+    def test_loud_head_before_quiet_tail_wins_too(self):
+        from plugins.platforms.discord.adapter import pcm_peak_window_dbfs
+
+        pcm = _square(seconds=0.6, amplitude=3000) + _square(seconds=5.0, amplitude=100)
+        assert pcm_peak_window_dbfs(pcm, int(0.5 * 192000)) > -40.0
+
+    def test_uniform_noise_stays_quiet(self):
+        from plugins.platforms.discord.adapter import pcm_peak_window_dbfs
+
+        pcm = _square(seconds=3.0, amplitude=100)
+        assert pcm_peak_window_dbfs(pcm, int(0.5 * 192000)) < -40.0
+
+
+@pytest.mark.asyncio
+async def test_completed_utterance_with_quiet_lead_in_still_cuts_playback():
+    """Codex-Review 2026-09-05, second round: the mean hid the words."""
+    adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -40})
+    vc = _prepare_loop(adapter)
+    receiver = adapter._voice_receivers[42]
+    pcm = _square(seconds=5.0, amplitude=100) + _square(seconds=0.6, amplitude=600)
+    receiver.check_silence.side_effect = [[(99, pcm)]] + [[]] * 200
+
+    await _run_one_listen_pass(adapter)
+
+    vc.stop.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_completed_loud_utterance_still_cuts_playback():
     adapter = _make_adapter({"voice_barge_in": True, "voice_barge_in_min_dbfs": -40})
