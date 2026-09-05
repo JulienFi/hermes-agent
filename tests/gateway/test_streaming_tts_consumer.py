@@ -782,6 +782,53 @@ class TestWaitFinalised:
 
         _run_test(run)
 
+    def test_replenishment_below_the_old_peak_still_extends(self):
+        """Codex-Review 2026-09-05: a lifetime maximum misses the clause fed
+        while the previous one is draining."""
+        async def run(loop):
+            adapter = PendingAwareAdapter(1.0)          # deadline: 1.0 + 0.3
+            consumer = self._live_consumer(adapter)
+
+            async def drain():
+                await asyncio.sleep(0.5)
+                adapter.pending_seconds = 0.4          # half played out...
+                await asyncio.sleep(0.1)
+                adapter.pending_seconds = 0.9          # ...next clause fed, below the 1.0 peak
+                await asyncio.sleep(1.0)               # plays out until t=1.6
+                consumer._completed = True
+
+            consumer._task = asyncio.ensure_future(drain())
+            ok = await consumer.wait_finalised(grace=0.3, ceiling=10.0, poll=0.05)
+            assert ok is True
+
+        _run_test(run)
+
+    def test_cancelled_caller_gets_the_result_back_at_once(self):
+        """Codex-Review 2026-09-05: shutdown cancels the turn; the wait must
+        return to the abort path instead of polling on."""
+        async def run(loop):
+            consumer = self._live_consumer(PendingAwareAdapter(50.0))
+            consumer._task = asyncio.ensure_future(asyncio.sleep(10))
+            waiter = asyncio.ensure_future(consumer.wait_finalised(grace=5.0, ceiling=120.0, poll=0.05))
+            await asyncio.sleep(0.15)
+            started = time.monotonic()
+            waiter.cancel()
+            result = await waiter
+            consumer._task.cancel()
+            assert result is False
+            assert time.monotonic() - started < 0.5
+
+        _run_test(run)
+
+    def test_no_task_returns_without_waiting(self):
+        async def run(loop):
+            consumer = self._live_consumer(PendingAwareAdapter(50.0))
+            started = time.monotonic()
+            assert await consumer.wait_finalised(grace=10.0) is False
+            assert time.monotonic() - started < 0.2
+
+        _run_test(run)
+
     def test_finished_task_returns_at_once(self):
         async def run(loop):
             consumer = self._live_consumer(PendingAwareAdapter(500.0))

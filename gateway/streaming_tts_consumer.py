@@ -598,28 +598,44 @@ class StreamingTTSConsumer:
         by "a few seconds plus grace" and the reply was cut once more
         (Discord, 2026-09-05: three turns aborted 14 s after their last
         clause, ~8 s of speech each still queued).  So the deadline is
-        recomputed while waiting and extended whenever *more* audio turns
-        up — not on every poll, or a silent stall would extend itself by
-        ``grace`` forever — and never past ``ceiling`` from the start.
+        recomputed while waiting and extended whenever the queue *grew*
+        since the last poll — not on every poll, or a silent stall would
+        extend itself by ``grace`` forever; and not only past its lifetime
+        peak, or a clause fed while the previous one drains would be missed
+        (Codex-Review 2026-09-05) — and never past ``ceiling`` from the
+        start.  A cancelled caller gets the current result back at once, as
+        the single wait did, so shutdown reaches its abort path.
         Returns the drain result.
         """
+        if self._task is None:
+            return self._completed
         start = time.monotonic()
         hard = start + float(ceiling)
-        seen = self._pending_seconds()
-        deadline = min(hard, start + seen + float(grace))
+        last = self._pending_seconds()
+        deadline = min(hard, start + last + float(grace))
         while True:
             if self.done:
                 return self._completed
             now = time.monotonic()
             if now >= deadline:
                 return self._completed
-            await self.wait_complete(timeout=max(0.0, min(float(poll), deadline - now)))
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._task),
+                    timeout=max(0.0, min(float(poll), deadline - now)),
+                )
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                return self._completed
+            except Exception:
+                pass
             if self.done:
                 return self._completed
             pending = self._pending_seconds()
-            if pending > seen:
-                seen = pending
+            if pending > last:
                 deadline = min(hard, max(deadline, time.monotonic() + pending + float(grace)))
+            last = pending
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
