@@ -5656,18 +5656,25 @@ class DiscordAdapter(BasePlatformAdapter):
             transcript = result.get("transcript", "").strip()
             seconds = len(pcm_data) / (VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2)
             level = pcm_dbfs(pcm_data)
+            # Whisper's own verdict (Groq verbose_json / local segments);
+            # "n/a" when the provider returns plain text.
+            nsp = result.get("no_speech_prob")
+            confidence = "n/a" if nsp is None else f"nsp={float(nsp):.2f}"
+            dropped = result.get("segments_dropped")
+            if dropped:
+                confidence += f" dropped={dropped}"
             if not transcript or is_whisper_hallucination(transcript):
                 # Silent drops hid the cause of 2026-09-05's false barge-ins:
                 # the audio that cut playback surfaced only as "12 chars".
                 logger.info(
-                    "Voice input dropped as hallucination (%.1fs, %.1f dBFS): %r",
-                    seconds, level, transcript[:60],
+                    "Voice input dropped as hallucination (%.1fs, %.1f dBFS, %s): %r",
+                    seconds, level, confidence, transcript[:60],
                 )
                 return
 
             logger.info(
-                "Voice input from user %d (%.1fs, %.1f dBFS): %s",
-                user_id, seconds, level, transcript[:100],
+                "Voice input from user %d (%.1fs, %.1f dBFS, %s): %s",
+                user_id, seconds, level, confidence, transcript[:100],
             )
 
             if self._voice_input_callback:

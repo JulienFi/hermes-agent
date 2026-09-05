@@ -1913,9 +1913,40 @@ def _is_hallucinated_segment(segment: Any, no_speech_threshold: float, logprob_t
 
 def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
     """Join segment texts, dropping probable silence hallucinations."""
-    no_speech_threshold, logprob_threshold = _confidence_thresholds(local_cfg)
+    return _gate_segments(segments, local_cfg)["transcript"]
+
+
+def _segment_float(segment: Any, name: str) -> Optional[float]:
+    value = getattr(segment, name, None)
+    if value is None and isinstance(segment, dict):
+        value = segment.get(name)
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gate_segments(segments: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Join segment texts, dropping probable silence hallucinations.
+
+    Returns the transcript plus the confidence the caller may want to log
+    or act on: ``no_speech_prob`` (max over all segments), ``avg_logprob``
+    (min over all segments) and ``segments_dropped``.  Works on
+    faster-whisper ``Segment`` objects and on the OpenAI SDK's
+    ``TranscriptionSegment`` (Groq ``verbose_json``) alike.
+    """
+    no_speech_threshold, logprob_threshold = _confidence_thresholds(cfg)
     kept: list[str] = []
+    dropped = 0
+    worst_no_speech: Optional[float] = None
+    worst_logprob: Optional[float] = None
     for segment in segments:
+        nsp = _segment_float(segment, "no_speech_prob")
+        alp = _segment_float(segment, "avg_logprob")
+        if nsp is not None:
+            worst_no_speech = nsp if worst_no_speech is None else max(worst_no_speech, nsp)
+        if alp is not None:
+            worst_logprob = alp if worst_logprob is None else min(worst_logprob, alp)
         if _is_hallucinated_segment(segment, no_speech_threshold, logprob_threshold):
             logger.debug(
                 "Dropping probable hallucinated segment %r (no_speech_prob=%.3f, avg_logprob=%.3f)",
@@ -1923,9 +1954,18 @@ def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
                 getattr(segment, "no_speech_prob", float("nan")),
                 getattr(segment, "avg_logprob", float("nan")),
             )
+            dropped += 1
             continue
-        kept.append(segment.text.strip())
-    return " ".join(kept).strip()
+        text = getattr(segment, "text", None)
+        if text is None and isinstance(segment, dict):
+            text = segment.get("text")
+        kept.append(str(text or "").strip())
+    return {
+        "transcript": " ".join(t for t in kept if t).strip(),
+        "no_speech_prob": worst_no_speech,
+        "avg_logprob": worst_logprob,
+        "segments_dropped": dropped,
+    }
 
 
 def _transcribe_local(
@@ -2191,6 +2231,14 @@ def _transcribe_groq(
     ``pre_transcription`` hook override > ``stt.groq.language`` >
     ``stt.language`` (config.yaml) > ``HERMES_LOCAL_STT_LANGUAGE`` (env).
     When none is set, Groq Whisper auto-detects.
+
+    Asks for ``verbose_json`` so every segment carries ``no_speech_prob``
+    and ``avg_logprob`` (checked against Groq on 2026-09-05 with
+    whisper-large-v3-turbo).  The same AND gate as the local path
+    (``stt.local.no_speech_prob_threshold`` / ``logprob_threshold``, a
+    ``stt.groq`` key of the same name wins) drops silence hallucinations
+    at the model instead of at a phrase list; the result carries the worst
+    values and the drop count for the caller's log line.
     """
     api_key = _resolve_provider_key("GROQ_API_KEY", "groq")
     if not api_key:
@@ -2213,7 +2261,7 @@ def _transcribe_groq(
         try:
             create_kwargs = {
                 "model": model_name,
-                "response_format": "text",
+                "response_format": "verbose_json",
             }
             if language:
                 create_kwargs["language"] = language
@@ -2227,11 +2275,27 @@ def _transcribe_groq(
                     **create_kwargs,
                 )
 
-            transcript_text = str(transcription).strip()
-            logger.info("Transcribed %s via Groq API (%s, lang=%s, %d chars)",
-                         Path(file_path).name, model_name, language or "auto", len(transcript_text))
+            segments = getattr(transcription, "segments", None)
+            if isinstance(segments, (list, tuple)):
+                stt_cfg = _load_stt_config()
+                gate_cfg = {**(stt_cfg.get("local") or {}), **(stt_cfg.get("groq") or {})}
+                gated = _gate_segments(segments, gate_cfg)
+                transcript_text = gated["transcript"]
+                extra = {k: gated[k] for k in ("no_speech_prob", "avg_logprob", "segments_dropped")}
+            else:
+                # ``text`` format (older callers, test doubles) or a verbose
+                # answer without segments: take the text as it is.
+                text = getattr(transcription, "text", None)
+                transcript_text = str(text if text is not None else transcription).strip()
+                extra = {}
+            logger.info(
+                "Transcribed %s via Groq API (%s, lang=%s, %d chars, no_speech_prob=%s, dropped=%s)",
+                Path(file_path).name, model_name, language or "auto", len(transcript_text),
+                "n/a" if extra.get("no_speech_prob") is None else f"{extra['no_speech_prob']:.2f}",
+                extra.get("segments_dropped", "n/a"),
+            )
 
-            return {"success": True, "transcript": transcript_text, "provider": "groq"}
+            return {"success": True, "transcript": transcript_text, "provider": "groq", **extra}
         finally:
             close = getattr(client, "close", None)
             if callable(close):

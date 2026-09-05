@@ -12,6 +12,7 @@ import subprocess
 import types
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -177,7 +178,80 @@ class TestExplicitProviderRespected:
 # _transcribe_groq
 # ============================================================================
 
+def _verbose(text, *segments):
+    """A TranscriptionVerbose double: (text, no_speech_prob, avg_logprob) per segment."""
+    return SimpleNamespace(
+        text=text,
+        segments=[SimpleNamespace(text=t, no_speech_prob=n, avg_logprob=a) for t, n, a in segments],
+    )
+
+
 class TestTranscribeGroq:
+    def test_asks_for_verbose_json_and_gates_segments(self, monkeypatch, sample_wav):
+        """2026-09-05: with ``text`` Groq gave no confidence at all, so a 1 s
+        "Hallo" hallucinated as "Bis zum nächsten Mal." could only be caught
+        by a phrase list.  verbose_json carries no_speech_prob/avg_logprob."""
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = _verbose(
+            " Hallo. Bis zum nächsten Mal.",
+            (" Hallo.", 0.05, -0.3),
+            (" Bis zum nächsten Mal.", 0.92, -1.4),
+        )
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch("tools.transcription_tools._load_stt_config", return_value={}):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+
+        assert mock_client.audio.transcriptions.create.call_args.kwargs["response_format"] == "verbose_json"
+        assert result["success"] is True
+        assert result["transcript"] == "Hallo."
+        assert result["segments_dropped"] == 1
+        assert result["no_speech_prob"] == 0.92
+        assert result["avg_logprob"] == -1.4
+
+    def test_quiet_but_confident_speech_survives_the_gate(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = _verbose(
+            " leise", (" leise", 0.9, -0.2),        # high no_speech_prob but decoded confidently
+        )
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch("tools.transcription_tools._load_stt_config", return_value={}):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+        assert result["transcript"] == "leise"
+        assert result["segments_dropped"] == 0
+
+    def test_groq_section_thresholds_win_over_local(self, monkeypatch, sample_wav):
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = _verbose(
+            " x", (" x", 0.5, -0.9),
+        )
+        cfg = {"local": {"no_speech_prob_threshold": 0.6, "logprob_threshold": -1.0},
+               "groq": {"no_speech_prob_threshold": 0.4, "logprob_threshold": -0.5}}
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client), \
+             patch("tools.transcription_tools._load_stt_config", return_value=cfg):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+        assert result["transcript"] == "" and result["segments_dropped"] == 1
+
+    def test_plain_text_answer_still_works(self, monkeypatch, sample_wav):
+        """A string (``text`` format, or a double) carries no segments: taken as is."""
+        monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.return_value = "hello world"
+        with patch("tools.transcription_tools._HAS_OPENAI", True), \
+             patch("openai.OpenAI", return_value=mock_client):
+            from tools.transcription_tools import _transcribe_groq
+            result = _transcribe_groq(sample_wav, "whisper-large-v3-turbo")
+        assert result["transcript"] == "hello world"
+        assert "no_speech_prob" not in result
+
     def test_no_key(self, monkeypatch):
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         from tools.transcription_tools import _transcribe_groq

@@ -1990,6 +1990,8 @@ DEFAULT_CONFIG = {
             "logprob_threshold": -1.0,  # ...AND its avg_logprob is BELOW this (both must hit)
             "unload_after_idle_seconds": 0,  # 0=never (default); e.g. 300 releases the model after 5min idle
         },
+        # Groq (verbose_json) applies the same no_speech_prob/logprob gate as
+        # stt.local; put the two keys under stt.groq to override them for Groq only.
         "groq": {
             "model": "whisper-large-v3-turbo",  # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force

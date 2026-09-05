@@ -2168,6 +2168,8 @@ stt:
     unload_after_idle_seconds: 0   # 0=never unload (default); e.g. 300 = release the model after 5min idle
   groq:
     language: ""               # per-provider override of stt.language
+    # Groq asks Whisper for verbose_json and applies the same two-threshold gate as stt.local;
+    # set no_speech_prob_threshold / logprob_threshold here to override the local values for Groq only.
   openai:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe | gpt-transcribe
     language: ""               # per-provider override of stt.language
